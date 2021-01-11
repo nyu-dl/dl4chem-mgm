@@ -17,6 +17,7 @@ import numpy as np
 import torch
 from guacamol.distribution_learning_benchmark import ValidityBenchmark, UniquenessBenchmark, KLDivBenchmark
 from rdkit import Chem
+from rdkit.Chem import Crippen, Descriptors
 from torch import optim
 from torch.nn import functional as F
 
@@ -355,33 +356,33 @@ def calculate_gen_benchmarks(generator, gen_num_samples, training_smiles, logger
         'Validity Score={}, Uniqueness Score={}, KlDiv Score={}'.format(validity_score, uniqueness_score,
                                                                         kldiv_score))
 
-def graph_to_mol(nodes, edges, init_charge=None, init_chirality=None, min_charge=-1,
+def graph_to_mol(init_node_properties, init_edge_properties, min_charge=-1,
                  node_target_inds=None, edge_target_coords_mat=None, return_pos=False,
                  symbol_list=QM9_SYMBOL_LIST):
     mol = Chem.EditableMol(Chem.Mol())
     node_highlight_pos, edge_highlight_pos = [], []
-    for i, node_ind in enumerate(nodes):
+    for i, node_ind in enumerate(init_node_properties['node_type']):
         if not 0 <= node_ind < len(symbol_list): continue
         atom = Chem.Atom(symbol_list[node_ind])
-        if init_charge is not None:
-            atom.SetFormalCharge(init_charge[i].item() - abs(min_charge))
-        if init_chirality is not None:
-            chiral_tag = Chem.ChiralType.values[int(init_chirality[i])]
+        if init_node_properties['charge'] is not None:
+            atom.SetFormalCharge(init_node_properties['charge'][i].item() - abs(min_charge))
+        if init_node_properties['chirality'] is not None:
+            chiral_tag = Chem.ChiralType.values[int(init_node_properties['chirality'][i])]
             atom.SetChiralTag(chiral_tag)
         mol.AddAtom(atom)
         if node_target_inds is not None and node_target_inds[i] == 1:
             node_highlight_pos.append(i)
-    adj_mat_coords = list(zip(*np.triu_indices(len(nodes), k=1)))
+    adj_mat_coords = list(zip(*np.triu_indices(len(init_node_properties['node_type']), k=1)))
     edge_id = 0
     for i, j in adj_mat_coords:
-        edge = int(edges[i, j])
+        edge = int(init_edge_properties['edge_type'][i, j])
         if edge in BOND_TYPES.keys():
             mol.AddBond(int(i), int(j), BOND_TYPES[edge])
             if edge_target_coords_mat is not None and int(edge_target_coords_mat[i, j]) == 1:
                 edge_highlight_pos.append(edge_id)
             edge_id += 1
     mol = mol.GetMol()
-    if init_chirality is not None:
+    if init_node_properties['chirality'] is not None:
         try:
             mol.UpdatePropertyCache()
             for atom in mol.GetAtoms():
@@ -415,3 +416,16 @@ def filter_top_k(logits, k, filter_value=-99999):
         indices_to_remove = logits < torch.topk(logits, k)[0][..., -1, None]
         logits[indices_to_remove] = filter_value
     return logits
+
+def calculate_graph_properties(mols, property_names):
+    graph_property_mapper = {'molwt': Descriptors.MolWt, 'logp': Crippen.MolLogP}
+    graph_properties = {}
+    for name in property_names:
+        graph_properties[name] = [graph_property_mapper[name](m) for m in mols]
+    return graph_properties
+
+def dct_to_cuda(dct):
+    return {key: value.cuda() for key, value in dct.items()}
+
+def dct_to_cpu(dct):
+    return {key: value.cpu() for key, value in dct.items()}

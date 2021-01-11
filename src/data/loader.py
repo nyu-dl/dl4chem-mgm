@@ -162,7 +162,7 @@ class QM9DatasetAR(TorchDataset):
         return len(self.mol_nodeinds)
 
 class QM9DatasetGraph(TorchDataset):
-    def __init__(self, graph_infos, params, train=True):
+    def __init__(self, graph_infos, params, train=True, graph_properties=None):
         # set parameters
         self.max_nodes = params.max_nodes
         self.num_node_types = params.num_node_types
@@ -193,49 +193,61 @@ class QM9DatasetGraph(TorchDataset):
         self.seed = params.seed
         self.max_hs = params.max_hs
         self.weighted_loss = params.weighted_loss if hasattr(params, 'weighted_loss') else False
+
+        self.node_properties, self.edge_properties, self.graph_properties = {}, {}, {}
+
         self.min_charge = params.min_charge; self.max_charge = params.max_charge
         self.mask_all_ring_properties = params.mask_all_ring_properties
 
-        self.mol_nodeinds, self.adj_mats, self.num_hs, self.charge, self.is_in_ring, self.is_aromatic,\
-            self.chirality = zip(*graph_infos)
+        self.node_property_names = ['node_type', 'hydrogens', 'charge', 'is_in_ring', 'is_aromatic', 'chirality']
+        self.edge_property_names = ['edge_type']
+        self.graph_property_names = ['molwt', 'logp']
+        self.normalise_graph_properties = params.normalise_graph_properties
+        node_type, edge_type, num_hs, charge, is_in_ring, is_aromatic, chirality = zip(*graph_infos)
+        if graph_properties != None:
+            self.graph_properties['molwt'], self.graph_properties['logp'] = zip(*graph_properties)
+            self.graph_property_stats = {name: {'mean': np.mean(data), 'std': np.std(data)} \
+                                         for name, data in self.graph_properties.items()}
 
-        self.num_h_categories = self.max_hs + 1
-        self.num_charge_categories = abs(self.min_charge) + self.max_charge + 1
-        self.num_is_in_ring_categories = 2
-        self.num_is_aromatic_categories = 2
-        self.num_chirality_categories = 4
+        num_h_categories = self.max_hs + 1
+        num_charge_categories = abs(self.min_charge) + self.max_charge + 1
+        num_is_in_ring_categories = 2
+        num_is_aromatic_categories = 2
+        num_chirality_categories = 4
 
-        if self.weighted_loss is True:
-            self.node_weights, self.edge_weights, self.h_weights, self.charge_weights, self.is_in_ring_weights,\
-                self.is_aromatic_weights, self.chirality_weights = get_loss_weights(graph_infos,
-            self.num_node_types, self.num_edge_types, self.num_h_categories, self.num_charge_categories,
-            self.num_is_in_ring_categories, self.num_is_aromatic_categories, self.num_chirality_categories,
-                                                                                    min_charge=self.min_charge)
-
-
-
-        if sparse.issparse(self.adj_mats[0]): self.adj_mats = [adj_mat.todense() for adj_mat in self.adj_mats]
+        if sparse.issparse(edge_type[0]): edge_type = [et.todense() for et in edge_type]
         # indices -> 0: no hydrogens, max_hs: max_hydrogens, max_hs+1: mask
-        self.h_mask_index = self.max_hs + 1
-        self.h_empty_index = 0
-        self.charge_mask_index = self.num_charge_categories
-        self.is_in_ring_mask_index = self.num_is_in_ring_categories
-        self.is_aromatic_mask_index = self.num_is_aromatic_categories
-        self.chirality_mask_index = self.num_chirality_categories
+        h_mask_index = self.max_hs + 1
+        h_empty_index = 0
+        charge_mask_index = num_charge_categories
+        is_in_ring_mask_index = num_is_in_ring_categories
+        is_aromatic_mask_index = num_is_aromatic_categories
+        chirality_mask_index = num_chirality_categories
         # node arrays are of format [nodes ... , mask]
         # edge arrays are of format [no edge, edge types ... , mask]
-        self.node_mask_index = self.num_node_types
-        self.node_empty_index = self.num_node_types + 1
-        self.edge_mask_index = self.num_edge_types
+        node_mask_index = self.num_node_types
+        node_empty_index = self.num_node_types + 1
+        edge_mask_index = self.num_edge_types
         if self.no_edge_present_type == 'learned':
-            self.edge_empty_index = self.num_edge_types + 1
+            edge_empty_index = self.num_edge_types + 1
         elif self.no_edge_present_type == 'zeros':
-            self.edge_empty_index = 0
+            edge_empty_index = 0
+
+        def add_to_dict(dct, property_name, data, num_categories, mask_index, empty_index):
+            dct[property_name] = {'data': data, 'num_categories': num_categories, 'mask_index': mask_index,
+                                  'empty_index': empty_index}
+        add_to_dict(self.node_properties, 'node_type', node_type, self.num_node_types, node_mask_index, node_empty_index)
+        add_to_dict(self.node_properties, 'hydrogens', num_hs, num_h_categories, h_mask_index, h_empty_index)
+        add_to_dict(self.node_properties, 'charge', charge, num_charge_categories, charge_mask_index, abs(self.min_charge))
+        add_to_dict(self.node_properties, 'is_in_ring', is_in_ring, num_is_in_ring_categories, is_in_ring_mask_index, 0)
+        add_to_dict(self.node_properties, 'is_aromatic', is_aromatic, num_is_aromatic_categories, is_aromatic_mask_index, 0)
+        add_to_dict(self.node_properties, 'chirality', chirality, num_chirality_categories, chirality_mask_index, 0)
+
+        add_to_dict(self.edge_properties, 'edge_type', edge_type, self.num_edge_types, edge_mask_index, edge_empty_index)
+
+        self.node_property_weights, self.edge_property_weights = self.get_loss_weights()
+
         self.mask_independently = params.mask_independently
-
-        self.adj_mat_inds = np.indices((self.max_nodes, self.max_nodes))
-        self.binary_classification = params.binary_classification
-
         self.target_data_structs = params.target_data_structs
         if self.target_data_structs == 'nodes':
             self.nodes_only, self.edges_only = True, False
@@ -249,19 +261,47 @@ class QM9DatasetGraph(TorchDataset):
 
         self.train = train
 
+    def get_loss_weights(self):
+        # ones instead of zeros to avoid possible divide by zero later on
+        node_property_counts, edge_property_counts = {}, {}
+        for name, property_info in self.node_properties.items():
+            node_property_counts[name] = np.ones(property_info['num_categories'])
+            ml = property_info['num_categories']
+            for single_datapoint_property in property_info['data']:
+                if name == 'charge': single_datapoint_property = single_datapoint_property + abs(self.min_charge)
+                node_property_counts[name] += np.bincount(single_datapoint_property, minlength=ml)
+        for name, property_info in self.edge_properties.items():
+            edge_property_counts[name] = np.ones(property_info['num_categories'])
+            ml = property_info['num_categories']
+            for single_datapoint_property in property_info['data']:
+                flattened_triu_property = np.triu(single_datapoint_property, k=1).flatten().astype(np.int)
+                edge_property_counts[name] += np.bincount(flattened_triu_property, minlength=ml)
 
-    def select_nodes_or_edges(self, unpadded_node_inds):
+        node_property_weights = {name: torch.Tensor(counts.max() / counts) \
+                                for name, counts in node_property_counts.items()}
+        edge_property_weights = {name: torch.Tensor(counts.max() / counts) \
+                                for name, counts in edge_property_counts.items()}
+
+        return node_property_weights, edge_property_weights
+
+    def select_nodes_or_edges(self, num_nodes):
         rnd = np.random.rand()
-        cutoff = 1 / ((len(unpadded_node_inds) + 1) / 2)
+        cutoff = 1 / ((num_nodes + 1) / 2)
         if rnd <= cutoff:
             nodes, edges = True, False
         else:
             nodes, edges = False, True
         return nodes, edges
 
-    def get_orig_and_init(self, data, max_nodes, num_nodes, empty_index):
+    def get_orig_and_init_node_property(self, data, max_nodes, num_nodes, empty_index):
         orig = np.ones(max_nodes) * empty_index
         orig[:num_nodes] = data
+        init = np.copy(orig)
+        return init, orig
+
+    def get_orig_and_init_edge_property(self, data, max_nodes, num_nodes, empty_index):
+        orig = np.ones((max_nodes, max_nodes)) * empty_index
+        orig[:num_nodes, :num_nodes] = data
         init = np.copy(orig)
         return init, orig
 
@@ -372,7 +412,7 @@ class QM9DatasetGraph(TorchDataset):
         if num_masked_edges > 0:
             # mask edges
             init_edges, edge_mask_coords = self.set_edge_values(init_edges, edge_mask_inds, edge_coords,
-                                                                self.edge_mask_index)
+                                                                self.edge_properties['edge_type']['mask_index'])
             mask_predict_edges = edge_mask_coords[np.random.choice(len(edge_mask_coords), int(self.mask_round_func(
                                                                     self.edge_mask_predict_frac * num_masked_edges)),
                                                                    replace=False)]
@@ -382,7 +422,8 @@ class QM9DatasetGraph(TorchDataset):
 
         if num_replaced_edges > 0:
             # replace edges
-            replacement_edges = np.random.randint(0, self.num_edge_types, size=num_replaced_edges)
+            replacement_edges = np.random.randint(0, self.edge_properties['edge_type']['num_categories'],
+                                                  size=num_replaced_edges)
             init_edges, edge_replace_coords = self.set_edge_values(init_edges, edge_replace_inds, edge_coords,
                                                                    replacement_edges)
             replace_predict_edges = edge_replace_coords[np.random.choice(len(edge_replace_coords),
@@ -400,92 +441,60 @@ class QM9DatasetGraph(TorchDataset):
 
         return init_edges, edge_target_types
 
-    def corrupt_graph(self, init_nodes, unpadded_node_inds, node_target_types, num_nodes, init_hydrogens,
-                      unpadded_num_hs, hydrogen_target_types, init_charge, unpadded_charge, charge_target_types,
-                      init_is_in_ring, unpadded_is_in_ring, is_in_ring_target_types,
-                      init_is_aromatic, unpadded_is_aromatic, is_aromatic_target_types,
-                      init_chirality, unpadded_chirality, chirality_target_types,
-                      init_edges, edge_coords, unpadded_edge_inds,
-                      edge_target_types, num_edges):
+    def corrupt_graph(self, unpadded_node_properties, init_node_properties, node_property_target_types, num_nodes,
+                      unpadded_edge_property_inds, init_edge_properties, edge_property_target_types,
+                      edge_coords, num_edges):
         if self.target_data_structs == 'random':
             # sample type of graph components (nodes or edges) to be masked
-            self.nodes_only, self.edges_only = self.select_nodes_or_edges(unpadded_node_inds)
+            self.nodes_only, self.edges_only = self.select_nodes_or_edges(num_nodes)
 
         predict_nodes, predict_edges = True, True
         if self.target_data_structs == 'both':
             if self.prediction_data_structs == 'random':
-                predict_nodes, predict_edges = self.select_nodes_or_edges(unpadded_node_inds)
+                predict_nodes, predict_edges = self.select_nodes_or_edges(num_nodes)
             elif self.prediction_data_structs == 'nodes':
                 predict_nodes, predict_edges = True, False
             elif self.prediction_data_structs == 'edges':
                 predict_nodes, predict_edges = False, True
 
-        init_nodes, node_target_types, node_mask_inds, node_replace_inds, node_recon_inds = self.corrupt_nodes(
-                                    init_nodes, unpadded_node_inds, node_target_types, num_nodes, predict_nodes,
-                                    self.node_mask_index, self.num_node_types)
-        if self.mask_independently is True:
-            init_hydrogens, hydrogen_target_types, _, _, _ = self.corrupt_nodes(
-                init_hydrogens, unpadded_num_hs, hydrogen_target_types, num_nodes, predict_nodes,
-                self.h_mask_index, self.num_h_categories)
-            init_charge, charge_target_types, _, _, _ = self.corrupt_nodes(
-                init_charge, unpadded_charge, charge_target_types, num_nodes, predict_nodes,
-                self.charge_mask_index, self.num_charge_categories)
-            init_is_in_ring, is_in_ring_target_types, _, _, _ = self.corrupt_nodes(
-                init_is_in_ring, unpadded_is_in_ring, is_in_ring_target_types, num_nodes, predict_nodes,
-                self.is_in_ring_mask_index, self.num_is_in_ring_categories)
-            init_is_aromatic, is_aromatic_target_types, _, _, _ = self.corrupt_nodes(
-                init_is_aromatic, unpadded_is_aromatic, is_aromatic_target_types, num_nodes, predict_nodes,
-                self.is_aromatic_mask_index, self.num_is_aromatic_categories)
-            init_chirality, chirality_target_types, _, _, _ = self.corrupt_nodes(
-                init_chirality, unpadded_chirality, chirality_target_types, num_nodes, predict_nodes,
-                self.chirality_mask_index, self.num_chirality_categories)
-        else:
-            self.corrupt_node_property(init_hydrogens, node_mask_inds, node_replace_inds,
-                                       self.h_mask_index, self.num_h_categories)
-            self.corrupt_node_property(init_charge, node_mask_inds, node_replace_inds,
-                                       self.charge_mask_index, self.num_charge_categories)
-            self.corrupt_node_property(init_is_in_ring, node_mask_inds, node_replace_inds,
-                                       self.is_in_ring_mask_index, self.num_is_in_ring_categories)
-            self.corrupt_node_property(init_is_aromatic, node_mask_inds, node_replace_inds,
-                                       self.is_aromatic_mask_index, self.num_is_aromatic_categories)
-            self.corrupt_node_property(init_chirality, node_mask_inds, node_replace_inds,
-                                       self.chirality_mask_index, self.num_chirality_categories)
+        for i, property_name in enumerate(unpadded_node_properties.keys()):
+            if self.mask_independently is True or i == 0:
+                init_node_properties[property_name], node_property_target_types[property_name], node_mask_inds, \
+                    node_replace_inds, node_recon_inds = self.corrupt_nodes(
+                    init_node_properties[property_name], unpadded_node_properties[property_name],
+                    node_property_target_types[property_name], num_nodes, predict_nodes,
+                    self.node_properties[property_name]['mask_index'],
+                    self.node_properties[property_name]['num_categories']
+                    )
+                latest_node_property_target_types = node_property_target_types[property_name]
+            else:
+                self.corrupt_node_property(init_node_properties[property_name], node_mask_inds, node_replace_inds,
+                                           self.node_properties[property_name]['mask_index'],
+                                           self.node_properties[property_name]['num_categories'])
+                node_property_target_types[property_name] = np.copy(latest_node_property_target_types)
 
-            hydrogen_target_types = np.copy(node_target_types)
-            charge_target_types = np.copy(node_target_types)
-            is_in_ring_target_types = np.copy(node_target_types)
-            is_aromatic_target_types = np.copy(node_target_types)
-            chirality_target_types = np.copy(node_target_types)
+        for i, property_name in enumerate(unpadded_edge_property_inds.keys()):
+            init_edge_properties[property_name], edge_property_target_types[property_name] = self.corrupt_edges(
+                init_edge_properties[property_name], edge_coords, unpadded_edge_property_inds[property_name],
+                edge_property_target_types[property_name], num_edges, predict_edges)
 
-        init_edges, edge_target_types = self.corrupt_edges(init_edges, edge_coords, unpadded_edge_inds,
-                                                       edge_target_types, num_edges, predict_edges)
-
-        return (init_nodes, node_target_types, num_nodes, init_hydrogens, hydrogen_target_types, init_charge,
-                charge_target_types, init_is_in_ring, is_in_ring_target_types, init_is_aromatic,
-                is_aromatic_target_types, init_chirality, chirality_target_types,
-                init_edges, edge_target_types, num_edges)
+        return (init_node_properties, node_property_target_types, init_edge_properties, edge_property_target_types)
 
     def __getitem__(self, index):
         set_seed_if(self.seed)
-        # Create arrays with node empty index where node does not exist, node index everywhere else
-        unpadded_node_inds = self.mol_nodeinds[index]
 
-        max_nodes = self.max_nodes if self.pad is True else len(unpadded_node_inds)
-        if self.binary_classification is True:
-            unpadded_node_inds[np.where(unpadded_node_inds != 1)] = 0
-
-        node_inds = np.ones(max_nodes) * self.node_empty_index
-        num_nodes = len(unpadded_node_inds)
-        node_inds[:num_nodes] = unpadded_node_inds
-
-        # Create matrices with edge empty index where edge would connect non-existent node, edge index everywhere else
-        unpadded_adj_mat = self.adj_mats[index]
-        if self.binary_classification is True:
-            unpadded_adj_mat[np.where(unpadded_adj_mat != 0)] = 1
-            
-        assert (check_symmetric(unpadded_adj_mat.astype(int))) # make sure bond matrix is symmetric
-        adj_mat = np.ones((max_nodes, max_nodes)) * self.edge_empty_index
-        adj_mat[:num_nodes, :num_nodes] = unpadded_adj_mat
+        # *** Initialise nodes ***
+        unpadded_node_properties, init_node_properties, orig_node_properties, node_property_target_types = {}, {}, {}, {}
+        for property_name, property_info in self.node_properties.items():
+            unpadded_data = property_info['data'][index]
+            if property_name == 'charge': unpadded_data = unpadded_data + abs(self.min_charge)
+            unpadded_node_properties[property_name] = unpadded_data
+            num_nodes = len(unpadded_data)
+            max_nodes = self.max_nodes if self.pad is True else num_nodes
+            init_node_properties[property_name], orig_node_properties[property_name] = \
+                self.get_orig_and_init_node_property(
+                    unpadded_data, max_nodes, len(unpadded_data), property_info['empty_index'])
+            node_property_target_types[property_name] = np.zeros(max_nodes)
 
         # Create masks with 0 where node does not exist or edge would connect non-existent node, 1 everywhere else
         node_mask = torch.zeros(max_nodes)
@@ -494,77 +503,75 @@ class QM9DatasetGraph(TorchDataset):
         edge_mask[:num_nodes, :num_nodes] = 1
         edge_mask[np.arange(num_nodes), np.arange(num_nodes)] = 0
 
-        # *** Initialise nodes ***
-        unpadded_num_hs = self.num_hs[index]
-        unpadded_charge = self.charge[index] + abs(self.min_charge)
-        unpadded_is_in_ring = self.is_in_ring[index]
-        unpadded_is_aromatic = self.is_aromatic[index]
-        unpadded_chirality = self.chirality[index]
-        init_hydrogens, orig_hydrogens = self.get_orig_and_init(unpadded_num_hs, max_nodes, num_nodes,
-                                                                self.h_empty_index)
-        init_charge, orig_charge = self.get_orig_and_init(unpadded_charge, max_nodes,
-                                                          num_nodes, abs(self.min_charge))
-        init_is_in_ring, orig_is_in_ring = self.get_orig_and_init(unpadded_is_in_ring, max_nodes, num_nodes, 0)
-        init_is_aromatic, orig_is_aromatic = self.get_orig_and_init(unpadded_is_aromatic, max_nodes, num_nodes, 0)
-        init_chirality, orig_chirality = self.get_orig_and_init(unpadded_chirality, max_nodes, num_nodes, 0)
-
-        init_nodes = np.copy(node_inds)
-        node_target_types = np.zeros(node_mask.shape)
-        hydrogen_target_types = np.zeros(node_mask.shape)
-        charge_target_types = np.zeros(node_mask.shape)
-        is_in_ring_target_types = np.zeros(node_mask.shape)
-        is_aromatic_target_types = np.zeros(node_mask.shape)
-        chirality_target_types = np.zeros(node_mask.shape)
-
-        if self.mask_all_ring_properties is True:
-            init_is_in_ring[:] = self.is_in_ring_mask_index
-            init_is_aromatic[:] = self.is_aromatic_mask_index
-
         # *** Initialise edges ***
-
-        # Get (row, column) coordinates of upper triangular part of adjacency matrix excluding diagonal. These are
-        # potential target edges. Also get values of the matrix at these indices.
-        init_edges = np.copy(adj_mat)
-        edge_coords, edge_vals = [], []
-        for i in range(num_nodes):
-            for j in range(i + 1, num_nodes):
-                edge_coords.append((i, j))
-                edge_vals.append(unpadded_adj_mat[i, j])
-        edge_coords = np.array(edge_coords)
-        unpadded_edge_inds = np.array(edge_vals)
+        edge_coords = [(i, j) for i in range(num_nodes) for j in range(i + 1, num_nodes)]
         num_edges = len(edge_coords)
-
-        edge_target_types = np.zeros(edge_mask.shape)
-        # *** return values ***
+        unpadded_edge_properties, unpadded_edge_property_inds, init_edge_properties, orig_edge_properties,\
+            edge_property_target_types = {}, {}, {}, {}, {}
+        for property_name, property_info in self.edge_properties.items():
+            unpadded_data = property_info['data'][index]
+            unpadded_edge_properties[property_name] = unpadded_data
+            assert (check_symmetric(unpadded_data.astype(int)))  # make sure bond matrix is symmetric
+            unpadded_edge_property_inds[property_name] = np.array([unpadded_data[i, j] for (i, j) in edge_coords])
+            init_edge_properties[property_name], orig_edge_properties[property_name] =\
+                self.get_orig_and_init_edge_property(
+                unpadded_data, max_nodes, len(unpadded_data), property_info['empty_index'])
+            edge_property_target_types[property_name] = np.zeros(edge_mask.shape)
+        edge_coords = np.array(edge_coords)
 
         if self.do_not_corrupt is False:
-            init_nodes, node_target_types, num_nodes, init_hydrogens, hydrogen_target_types, init_charge, \
-            charge_target_types, init_is_in_ring, is_in_ring_target_types, init_is_aromatic, \
-            is_aromatic_target_types, init_chirality, chirality_target_types, init_edges, \
-            edge_target_types, num_edges = self.corrupt_graph(init_nodes, unpadded_node_inds, node_target_types,
-                      num_nodes, init_hydrogens, unpadded_num_hs, hydrogen_target_types, init_charge, unpadded_charge,
-                      charge_target_types, init_is_in_ring, unpadded_is_in_ring, is_in_ring_target_types,
-                      init_is_aromatic, unpadded_is_aromatic, is_aromatic_target_types,
-                      init_chirality, unpadded_chirality, chirality_target_types,
-                      init_edges, edge_coords, unpadded_edge_inds,
-                      edge_target_types, num_edges)
+            init_node_properties, node_property_target_types, init_edge_properties, edge_property_target_types = \
+                self.corrupt_graph(unpadded_node_properties, init_node_properties, node_property_target_types,
+                                   num_nodes, unpadded_edge_property_inds, init_edge_properties,
+                                   edge_property_target_types, edge_coords, num_edges)
 
         if self.no_edge_present_type == 'zeros':
-            edge_mask[np.where(init_edges == 0)] = 0
+            edge_mask[np.where(init_edge_properties['edge_type'] == 0)] = 0
 
-        ret_list = [torch.LongTensor(init_nodes), torch.LongTensor(init_edges), torch.LongTensor(node_inds),
-                    torch.LongTensor(adj_mat), node_mask, edge_mask, node_target_types.astype(np.int8),
-                    edge_target_types.astype(np.int8), torch.LongTensor(init_hydrogens), torch.LongTensor(orig_hydrogens),
-                    torch.LongTensor(init_charge), torch.LongTensor(orig_charge), torch.LongTensor(init_is_in_ring), torch.LongTensor(orig_is_in_ring),
-                    torch.LongTensor(init_is_aromatic), torch.LongTensor(orig_is_aromatic), torch.LongTensor(init_chirality),
-                    torch.LongTensor(orig_chirality), hydrogen_target_types.astype(np.int8),
-                    charge_target_types.astype(np.int8), is_in_ring_target_types.astype(np.int8),
-                    is_aromatic_target_types.astype(np.int8), chirality_target_types.astype(np.int8)]
+        # Cast to suitable type
+        """
+        init_node_properties = torch.LongTensor(np.stack([init_node_properties[property_name] \
+                                                          for property_name in self.node_property_names]))
+        orig_node_properties = torch.LongTensor(np.stack([orig_node_properties[property_name] \
+                                                          for property_name in self.node_property_names]))
+        node_property_target_types = np.stack([node_property_target_types[property_name] \
+                                              for property_name in self.node_property_names]).astype(np.int8)
+
+        init_edge_properties = torch.LongTensor(np.stack([init_edge_properties[property_name] \
+                                                          for property_name in self.edge_property_names]))
+        orig_edge_properties = torch.LongTensor(np.stack([orig_edge_properties[property_name] \
+                                                          for property_name in self.edge_property_names]))
+        edge_property_target_types = np.stack([edge_property_target_types[property_name] \
+                                               for property_name in self.edge_property_names]).astype(np.int8)
+        """
+
+
+        for property_name in init_node_properties.keys():
+            init_node_properties[property_name] = torch.LongTensor(init_node_properties[property_name])
+            orig_node_properties[property_name] = torch.LongTensor(orig_node_properties[property_name])
+            node_property_target_types[property_name] = node_property_target_types[property_name].astype(np.int8)
+
+        for property_name in init_edge_properties.keys():
+            init_edge_properties[property_name] = torch.LongTensor(init_edge_properties[property_name])
+            orig_edge_properties[property_name] = torch.LongTensor(orig_edge_properties[property_name])
+            edge_property_target_types[property_name] = edge_property_target_types[property_name].astype(np.int8)
+
+        graph_properties = {}
+        for k, v in self.graph_properties.items():
+            if self.normalise_graph_properties is True:
+                graph_properties[k] = torch.Tensor([ (v[index] - self.graph_property_stats[k]['mean']) / \
+                                                     self.graph_property_stats[k]['std'] ])
+            else:
+                graph_properties[k] = torch.Tensor([ v[index] ])
+
+        ret_list = [init_node_properties, orig_node_properties, node_property_target_types, node_mask,
+                    init_edge_properties, orig_edge_properties, edge_property_target_types, edge_mask,
+                    graph_properties]
 
         return ret_list
 
     def __len__(self):
-        return len(self.mol_nodeinds)
+        return len(self.node_properties['node_type']['data'])
 
 class SizeSampler(Sampler):
     r"""Samples elements sequentially in order of size.
@@ -575,7 +582,7 @@ class SizeSampler(Sampler):
 
     def __init__(self, data_source, edges_per_batch, shuffle=False):
         self.shuffle = shuffle
-        self.lengths = np.array([len(nodes)**2 for nodes in data_source.mol_nodeinds])
+        self.lengths = np.array([len(nodes)**2 for nodes in data_source.node_properties['node_type']['data']])
         self.indices = np.arange(len(data_source))
         self.indices = self.indices[np.argsort(self.lengths[self.indices], kind='mergesort')]
         batch_ids = []
@@ -600,72 +607,70 @@ class SizeSampler(Sampler):
     def __len__(self):
         return len(self.batches)
 
-def get_loss_weights(graph_infos, node_minlength, edge_minlength, *other_minlengths, min_charge=-1):
-    # ones instead of zeros to avoid possible divide by zero later on
-    node_types = np.ones(node_minlength)
-    edge_types = np.ones(edge_minlength)
-    other_distributions = [np.ones(minlength) for minlength in other_minlengths]
-    for info in graph_infos:
-        node_types += np.bincount(info[0], minlength=node_minlength)
-        edges = np.triu(info[1].todense(), k=1).flatten().astype(np.int)
-        edge_types += np.bincount(edges, minlength=edge_minlength)
-        for i in range(len(other_distributions)):
-            data = info[i + 2]
-            if i + 2 == 3: data = data + abs(min_charge)
-            other_distributions[i] += np.bincount(data, minlength=other_minlengths[i])
-
-    node_weights = torch.Tensor(node_types.max()/node_types)
-    edge_weights = torch.Tensor(edge_types.max()/edge_types)
-    other_weights = [torch.Tensor(other_distributions[i].max()/other_distributions[i]) \
-                     for i in range(len(other_distributions))]
-
-    return (node_weights, edge_weights, *other_weights)
 
 def load_graph_data(params, train_split=0.8):
     val_batch_size = params.batch_size if params.val_batch_size is None else params.val_batch_size
     val_edges_per_batch = params.edges_per_batch if params.val_edges_per_batch is None else params.val_edges_per_batch
-    if params.graph_type == 'QM9' or params.graph_type == 'ChEMBL':
-        with open(params.data_path, 'rb') as f:
+    def load_train_val_data(data_path, val_data_path=None):
+        with open(data_path, 'rb') as f:
             graph_infos = pickle.load(f)
         split = int(len(graph_infos) * train_split)
         if params.debug_small:
             train_graph_infos = graph_infos[:params.batch_size*params.num_batches]
             if params.validate_on_train is True:
-                val_graph_infos =  graph_infos[:params.batch_size*params.num_batches]
+                val_graph_infos = graph_infos[:params.batch_size*params.num_batches]
             else:
                 val_graph_infos = graph_infos[split:]
-        elif params.graph_type == 'QM9':
+        elif val_data_path is None:
             train_graph_infos = graph_infos[:split]
             val_graph_infos = graph_infos[split:]
-        elif params.graph_type == 'ChEMBL':
-            train_graph_infos = graph_infos
-            with open(params.val_data_path, 'rb') as f:
-                val_graph_infos = pickle.load(f)
-        train_graph_infos = limited_node_graph_infos(train_graph_infos, params.max_nodes)
-        val_graph_infos = limited_node_graph_infos(val_graph_infos, params.max_nodes)
-        if params.val_dataset_size > 0:
-            val_graph_infos = val_graph_infos[:params.val_dataset_size]
-        train_dataset = QM9DatasetGraph(train_graph_infos, params, train=True)
-        val_dataset = QM9DatasetGraph(val_graph_infos, params, train=False)
-        if hasattr(params, 'val_seed'): val_dataset.seed = params.val_seed
-        if params.edges_per_batch > 0:
-            train_batch_sampler = SizeSampler(train_dataset, params.edges_per_batch, params.shuffle)
-            train_batch_sampler.batches.reverse()
-            train_data_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler)
-            val_batch_sampler = SizeSampler(val_dataset, val_edges_per_batch)
-            val_data_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler)
         else:
-            train_data_loader = DataLoader(train_dataset, params.batch_size, shuffle=params.shuffle)
-            val_data_loader = DataLoader(val_dataset, val_batch_size)
+            train_graph_infos = graph_infos
+            with open(val_data_path, 'rb') as f:
+                val_graph_infos = pickle.load(f)
+        return train_graph_infos, val_graph_infos
+
+    if params.graph_type == 'QM9':
+        val_data_path, val_graph_properties_path = None, None
+    elif params.graph_type == 'ChEMBL':
+        val_data_path, val_graph_properties_path = params.val_data_path, params.val_graph_properties_path
+
+    train_graph_infos, val_graph_infos = load_train_val_data(params.data_path, val_data_path)
+    train_graph_infos, filtered_train_indices = limited_node_graph_infos(train_graph_infos, params.max_nodes)
+    val_graph_infos, filtered_val_indices = limited_node_graph_infos(val_graph_infos, params.max_nodes)
+    if len(params.graph_property_names) > 0:
+        train_graph_property_infos, val_graph_property_infos = load_train_val_data(
+            params.graph_properties_path, val_graph_properties_path)
+        train_graph_property_infos = [train_graph_property_infos[idx] for idx in filtered_train_indices]
+        val_graph_property_infos = [val_graph_property_infos[idx] for idx in filtered_val_indices]
+    else:
+        train_graph_property_infos = val_graph_property_infos = None
+
+    if params.val_dataset_size > 0:
+        val_graph_infos = val_graph_infos[:params.val_dataset_size]
+
+    train_dataset = QM9DatasetGraph(train_graph_infos, params, train=True, graph_properties=train_graph_property_infos)
+    val_dataset = QM9DatasetGraph(val_graph_infos, params, train=False, graph_properties=val_graph_property_infos)
+    if hasattr(params, 'val_seed'): val_dataset.seed = params.val_seed
+    if params.edges_per_batch > 0:
+        train_batch_sampler = SizeSampler(train_dataset, params.edges_per_batch, params.shuffle)
+        train_batch_sampler.batches.reverse()
+        train_data_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler)
+        val_batch_sampler = SizeSampler(val_dataset, val_edges_per_batch)
+        val_data_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler)
+    else:
+        train_data_loader = DataLoader(train_dataset, params.batch_size, shuffle=params.shuffle)
+        val_data_loader = DataLoader(val_dataset, val_batch_size)
 
     return train_dataset, val_dataset, train_data_loader, val_data_loader
 
 def limited_node_graph_infos(graph_infos, max_nodes):
-    restricted_graph_infos = []
-    for graph_info in graph_infos:
+    restricted_graph_infos, indices = [], []
+    for idx, graph_info in enumerate(graph_infos):
         if 1 < len(graph_info[0]) <= max_nodes:
             restricted_graph_infos.append(graph_info)
-    return restricted_graph_infos
+            indices.append(idx)
+    return restricted_graph_infos, indices
 
 def load_smiles_data(params):
     logger.info('============ Smiles data (%s)')

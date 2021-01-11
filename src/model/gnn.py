@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.model.mpnns import MPNN_DICT
+from collections import OrderedDict
 
 
 class GraphNNParent(nn.Module):
@@ -16,42 +17,45 @@ class GraphNNParent(nn.Module):
         self.dim_k = params.dim_k
 
         self.no_edge_present_type = params.no_edge_present_type
-        self.share_embed = params.share_embed
         self.mpnn_name = params.mpnn_name
-        self.num_node_types = params.num_node_types
-        self.num_edge_types = params.num_edge_types
-        if not self.share_embed:
-            self.num_input_node_classes = self.num_node_types + 2 # includes mask, empty
-            self.num_input_edge_classes = self.num_edge_types + 2
-            self.n_embedding_layer = nn.Embedding(self.num_input_node_classes, self.dim_h,
-                                                  padding_idx=self.num_input_node_classes-1)
-            if params.no_edge_present_type == 'zeros':
-                # zero out no edge present
-                self.e_embedding_layer = nn.Embedding(self.num_input_edge_classes, self.dim_h*self.dim_k,
-                                                      padding_idx=0)
-            else:
-                # learn representation for no edge present
-                self.e_embedding_layer = nn.Embedding(self.num_input_edge_classes, self.dim_h*self.dim_k,
-                                                      padding_idx=self.num_input_edge_classes-1)
-        if params.embed_hs:
-            self.embed_hs = True
-            self.min_charge = params.min_charge; self.max_charge = params.max_charge
-            self.num_input_h_classes = params.max_hs + 2 # includes 0, ..., max_hs, mask
-            self.num_input_charge_classes = abs(self.min_charge) + self.max_charge + 2
-            self.num_input_is_in_ring_classes = 3
-            self.num_input_is_aromatic_classes = 3
-            self.num_input_chirality_classes = 5
-            self.h_embedding_layer = nn.Embedding(self.num_input_h_classes, self.dim_h, padding_idx=0)
-            self.charge_embedding_layer = nn.Embedding(self.num_input_charge_classes, self.dim_h,
-                                                       padding_idx=abs(self.min_charge))
-            self.is_in_ring_embedding_layer = nn.Embedding(self.num_input_is_in_ring_classes, self.dim_h, padding_idx=0)
-            self.is_aromatic_embedding_layer = nn.Embedding(self.num_input_is_aromatic_classes, self.dim_h,
-                                                            padding_idx=0)
-            self.chirality_embedding_layer = nn.Embedding(self.num_input_chirality_classes, self.dim_h, padding_idx=0)
-        else:
-            self.embed_hs = False
-        self.res_conn = params.res_conn
 
+        self.node_property_classes_dct = OrderedDict([
+                                    ('node_type', {'num_input_classes': params.num_node_types + 2,
+                                                    'padding_idx': 0,
+                                                    'num_output_classes': params.num_node_types}),
+                                    ('hydrogens', {'num_input_classes': params.max_hs + 2,
+                                                    'padding_idx': 0,
+                                                    'num_output_classes': params.max_hs + 1}),
+                                    ('charge', {'num_input_classes': abs(params.min_charge) + params.max_charge + 2,
+                                                 'padding_idx': abs(params.min_charge),
+                                                 'num_output_classes': abs(params.min_charge) + params.max_charge + 1}),
+                                    ('is_in_ring', {'num_input_classes': 3, 'padding_idx': 0,
+                                                    'num_output_classes': 2}),
+                                    ('is_aromatic', {'num_input_classes': 3, 'padding_idx': 0,
+                                                     'num_output_classes': 2}),
+                                    ('chirality', {'num_input_classes': 5, 'padding_idx': 0,
+                                                    'num_output_classes': 4})
+                                    ])
+
+        edge_type_padding_idx = 0 if params.no_edge_present_type == 'zeros' else params.num_edge_types + 1
+        self.edge_property_classes_dct = OrderedDict([
+            ('edge_type', {'num_input_classes': params.num_edge_types + 2,
+                           'padding_idx': edge_type_padding_idx,
+                           'num_output_classes': params.num_edge_types}),
+            ])
+
+        self.node_embedding_layers = nn.ModuleDict({property_name:
+            nn.Embedding(classes_info['num_input_classes'], self.dim_h, padding_idx=classes_info['padding_idx'])
+            for property_name, classes_info in self.node_property_classes_dct.items()
+            })
+
+        self.edge_embedding_layers = nn.ModuleDict({property_name:
+            nn.Embedding(classes_info['num_input_classes'], self.dim_h * self.dim_k,
+                         padding_idx=classes_info['padding_idx'])
+            for property_name, classes_info in self.edge_property_classes_dct.items()
+            })
+
+        self.res_conn = params.res_conn
         self.mpnn_steps = params.mpnn_steps
         self.use_layer_norm = params.layer_norm
         self.update_edges_at_end_only = params.update_edges_at_end_only
@@ -63,37 +67,20 @@ class GraphNNParent(nn.Module):
         self.global_connection = params.global_connection
         self.bound_edges = params.bound_edges
 
-        self.nhh_dim = int(self.dim_h/2)
-        self.edge_classifier = nn.Sequential(nn.Linear(self.dim_h*self.dim_k, self.dim_h), nn.ReLU(),
-                                    nn.Linear(self.dim_h, self.num_edge_types, bias=(not self.share_embed)))
-        self.node_classifier = nn.Sequential(nn.Linear(self.dim_h, self.nhh_dim),
-                                                nn.ReLU(),
-                                                nn.Linear(self.nhh_dim, self.num_node_types, bias=(not self.share_embed))
-                                            )
-        self.hydrogen_classifier = nn.Sequential(nn.Linear(self.dim_h, self.nhh_dim),
-                                        nn.ReLU(),
-                                        nn.Linear(self.nhh_dim, self.num_input_h_classes-1, bias=(not self.share_embed))
-                                        )
-        self.charge_classifier = nn.Sequential(nn.Linear(self.dim_h, self.nhh_dim),
-                                        nn.ReLU(),
-                                        nn.Linear(self.nhh_dim, self.num_input_charge_classes-1,
-                                                  bias=(not self.share_embed))
-                                        )
-        self.is_in_ring_classifier = nn.Sequential(nn.Linear(self.dim_h, self.nhh_dim),
-                                        nn.ReLU(),
-                                        nn.Linear(self.nhh_dim, self.num_input_is_in_ring_classes-1,
-                                                  bias=(not self.share_embed))
-                                        )
-        self.is_aromatic_classifier = nn.Sequential(nn.Linear(self.dim_h, self.nhh_dim),
-                                        nn.ReLU(),
-                                        nn.Linear(self.nhh_dim, self.num_input_is_aromatic_classes-1,
-                                                  bias=(not self.share_embed))
-                                        )
-        self.chirality_classifier = nn.Sequential(nn.Linear(self.dim_h, self.nhh_dim),
-                                        nn.ReLU(),
-                                        nn.Linear(self.nhh_dim, self.num_input_chirality_classes-1,
-                                                  bias=(not self.share_embed))
-                                        )
+        self.nph_dim = int(self.dim_h/2)
+        self.node_property_classifiers = nn.ModuleDict({property_name: \
+            nn.Sequential(nn.Linear(self.dim_h, self.nph_dim),
+                          nn.ReLU(),
+                          nn.Linear(self.nph_dim, classes_info['num_output_classes'])) \
+            for property_name, classes_info in self.node_property_classes_dct.items()
+        })
+
+        self.edge_property_classifiers = nn.ModuleDict({property_name: \
+            nn.Sequential(nn.Linear(self.dim_h * self.dim_k, int(self.dim_h * self.dim_k/2)),
+                          nn.ReLU(),
+                          nn.Linear(int(self.dim_h * self.dim_k/2), classes_info['num_output_classes'])) \
+            for property_name, classes_info in self.edge_property_classes_dct.items()
+        })
 
         self.property_type = params.property_type
         if self.property_type is not None:
@@ -105,39 +92,47 @@ class GraphNNParent(nn.Module):
         if hasattr(params, 'num_iters'):
             self.num_iters = params.num_iters
 
-    def calculate_embeddings(self, node_inds, adj_mat_inds, init_hydrogens, init_charge, init_is_in_ring,
-                        init_is_aromatic, init_chirality):
-        if not self.share_embed:
-            node_embeddings = self.n_embedding_layer(node_inds)
-            edge_embeddings = self.e_embedding_layer(adj_mat_inds)
+        if len(params.graph_property_names) > 0:
+            self.graph_property_embedding_layers = nn.ModuleDict({name:
+                nn.Sequential(nn.Linear(1, int(self.dim_h/2)), nn.ReLU(), nn.Linear(int(self.dim_h/2), self.dim_h))
+                for name in params.graph_property_names})
         else:
-            node_embeddings = F.embedding(node_inds, self.node_classifier.weight * math.sqrt(self.dim_h/2))
-            edge_embeddings = F.embedding(adj_mat_inds, self.edge_classifier[2].weight * math.sqrt(self.dim_h))
-        if self.embed_hs is True:
-            hydrogen_embeddings = self.h_embedding_layer(init_hydrogens)
-            charge_embeddings = self.charge_embedding_layer(init_charge)
-            is_in_ring_embeddings = self.is_in_ring_embedding_layer(init_is_in_ring)
-            is_aromatic_embeddings = self.is_aromatic_embedding_layer(init_is_aromatic)
-            chirality_embeddings = self.chirality_embedding_layer(init_chirality)
-            node_embeddings = node_embeddings + hydrogen_embeddings + charge_embeddings + is_in_ring_embeddings + \
-                              is_aromatic_embeddings + chirality_embeddings
+            self.graph_property_embedding_layers = None
+
+        self.predict_graph_properties = params.predict_graph_properties
+        if self.predict_graph_properties is True:
+            self.graph_property_predictors = nn.ModuleDict({property_name: \
+                            nn.Sequential(nn.Linear(self.dim_h, 1)) for property_name in params.graph_property_names})
+
+    def calculate_embeddings(self, init_node_properties, init_edge_properties, graph_properties=None):
+        node_embeddings, edge_embeddings = [], []
+        for name, property in init_node_properties.items():
+            node_embeddings.append(self.node_embedding_layers[name](property))
+        node_embeddings = torch.stack(node_embeddings).sum(0)
+        for name, property in init_edge_properties.items():
+            edge_embeddings.append(self.edge_embedding_layers[name](property))
+        edge_embeddings = torch.stack(edge_embeddings).sum(0)
+        if self.graph_property_embedding_layers is not None:
+            for name, network in self.graph_property_embedding_layers.items():
+                graph_property_embedding = network(graph_properties[name])
+                node_embeddings += graph_property_embedding.unsqueeze(1)
+
         return node_embeddings, edge_embeddings.reshape(-1, self.max_nodes, self.max_nodes, self.dim_h, self.dim_k)
 
-    def project_output(self, nodes, edge_mats, init_hydrogens):
-        edges = edge_mats.reshape(-1, self.max_nodes**2, self.dim_h*self.dim_k)
-        if self.embed_hs is True:
-            hydrogen_scores = self.hydrogen_classifier(nodes)
-            charge_scores = self.charge_classifier(nodes)
-            is_in_ring_scores = self.is_in_ring_classifier(nodes)
-            is_aromatic_scores = self.is_aromatic_classifier(nodes)
-            chirality_scores = self.chirality_classifier(nodes)
-        else:
-            hydrogen_scores = init_hydrogens
-        node_scores = self.node_classifier(nodes)
-        edge_scores = self.edge_classifier(edges)
-        edge_scores = edge_scores.reshape(-1, self.max_nodes, self.max_nodes, edge_scores.shape[-1])
-        return node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores, is_aromatic_scores,\
-                chirality_scores
+    def project_output(self, nodes, edge_mats):
+        edges = edge_mats.reshape(-1, self.max_nodes ** 2, self.dim_h * self.dim_k)
+        node_property_scores, edge_property_scores, graph_property_scores = {}, {}, {}
+        for property_name, classifier in self.node_property_classifiers.items():
+            node_property_scores[property_name] = classifier(nodes)
+        for property_name, classifier in self.edge_property_classifiers.items():
+            edge_property_scores[property_name] = classifier(edges)
+            edge_property_scores[property_name] = edge_property_scores[property_name].reshape(
+                -1, self.max_nodes, self.max_nodes, edge_property_scores[property_name].shape[-1])
+        if self.predict_graph_properties is True:
+            for property_name, classifier in self.graph_property_predictors.items():
+                graph_property_scores[property_name] = classifier(nodes.sum(1))
+
+        return node_property_scores, edge_property_scores, graph_property_scores
 
     def predict_property(self, nodes, node_mask):
         nodes = nodes * node_mask
@@ -158,21 +153,17 @@ class GraphNN(GraphNNParent):
                                          mat_h=params.mat_h, mat_dropout=params.mat_dropout)
         self.mpnns = nn.ModuleList([copy.deepcopy(mpnn) for i in range(self.num_mpnns)])
 
-    def forward(self, node_inds, adj_mat_inds, node_mask, edge_mask, init_hydrogens, init_charge, init_is_in_ring,
-                        init_is_aromatic, init_chirality):
-        self.max_nodes = len(node_inds[0])
+    def forward(self, init_node_properties, node_mask, init_edge_properties, edge_mask, graph_properties=None):
+        self.max_nodes = init_node_properties['node_type'].shape[-1]
 
-        nodes, edge_mats = self.calculate_embeddings(node_inds, adj_mat_inds, init_hydrogens, init_charge,
-                                                     init_is_in_ring, init_is_aromatic, init_chirality)
+        nodes, edges = self.calculate_embeddings(init_node_properties, init_edge_properties, graph_properties)
 
         for mpnn_num in range(self.num_mpnns):
-            nodes, edge_mats = self.mpnns[mpnn_num](edge_mats, nodes, node_mask, edge_mask, adj_mat_inds)
+            nodes, edges = self.mpnns[mpnn_num](edges, nodes, node_mask, edge_mask, init_edge_properties['edge_type'])
 
-        node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores, is_aromatic_scores,\
-                chirality_scores = self.project_output(nodes, edge_mats, init_hydrogens)
+        node_property_scores, edge_property_scores, graph_property_scores = self.project_output(nodes, edges)
 
-        return node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores, is_aromatic_scores,\
-                chirality_scores
+        return node_property_scores, edge_property_scores, graph_property_scores
 
 class GraphVAE(GraphNNParent):
     def __init__(self, params, node_loss_weights=None, edge_loss_weights=None, hydrogen_loss_weights=None):

@@ -47,13 +47,13 @@ As an alternative to using pretrained models, the following are scripts for trai
 
 ### QM9
 `python train.py --data_path data/QM9/QM9_processed.p --graph_type QM9 --exp_name QM9_experiment
---num_node_types 5 --num_edge_types 5 --max_nodes 9 --embed_hs --layer_norm --spatial_msg_res_conn
+--num_node_types 5 --num_edge_types 5 --max_nodes 9 --layer_norm --spatial_msg_res_conn
 --batch_size 1024 --val_batch_size 2500 --val_after 105 --num_epochs 200 --shuffle
 --mask_independently --force_mask_predict --optimizer adam,lr=0.0001 --tensorboard`
 
 ### ChEMBL
 `python train.py --data_path data/ChEMBL/ChEMBL_train_processed.p --graph_type ChEMBL --exp_name chembl_experiment
---val_data_path data/ChEMBL/ChEMBL_val_processed.p --num_node_types 12 --num_edge_types 5 --max_nodes 88 --embed_hs
+--val_data_path data/ChEMBL/ChEMBL_val_processed.p --num_node_types 12 --num_edge_types 5 --max_nodes 88
 --min_charge -1 --max_charge 3 --mpnn_steps 6 --layer_norm --spatial_msg_res_conn --batch_size 32 --val_batch_size 64
 --grad_accum_iters 16 --val_after 3200 --num_epochs 5 --shuffle --force_mask_predict --mask_independently
 --optimizer adam,lr=0.0001 --tensorboard`

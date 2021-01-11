@@ -19,6 +19,10 @@ def get_parser():
                         help="Data path for QM9, train data path for ChEMBL")
     parser.add_argument("--val_data_path", type=str, default="data/ChEMBL/ChEMBL_val_processed_hs.p",
                         help="Validation data path for ChEMBL")
+    parser.add_argument("--graph_properties_path", type=str, default="",
+                        help="Data path for QM9, train data path for ChEMBL")
+    parser.add_argument("--val_graph_properties_path", type=str, default="data/ChEMBL/ChEMBL_val_graph_properties.p",
+                        help="Validation data path for ChEMBL")
     parser.add_argument("--seed", type=int, default=0,
                         help="random seed")
     parser.add_argument('--val_seed', type=int, default=None)
@@ -34,7 +38,7 @@ def get_parser():
     parser.add_argument('--model_name', choices=['GraphNN', 'GraphVAE', 'CGVAE'], default='GraphNN')
     parser.add_argument("--dim_h", type=int, default=2048,
                         help="Hidden dimension size")
-    parser.add_argument("--dim_k", type=int, default=1,
+    parser.add_argument("--dim_k", type=int, default= 1,
                         help="Max rank of edge matrices")
     parser.add_argument('--use_newest_edges', action='store_true', help='In MPNN, use most edges from layer l+1 instead'
                                                                         'of l to update nodes in layer l')
@@ -65,6 +69,11 @@ def get_parser():
     parser.add_argument('--prediction_data_structs', choices=['all', 'random', 'nodes', 'edges'], default='all',
                         help='mark all available target data struct types for prediction, choose one at random, '
                              'or choose a specific type')
+    parser.add_argument('--cond_virtual_node', action='store_true')
+    parser.add_argument('--num_graph_properties', type=int, default=0)
+    parser.add_argument('--graph_property_names', type=str, nargs='+', default=[])
+    parser.add_argument('--normalise_graph_properties', action='store_true')
+    parser.add_argument('--predict_graph_properties', action='store_true')
 
     # MPNN parameters
     parser.add_argument('--mpnn_name', choices=['EdgesOwnRepsMPNN', 'EdgesFromNodesMPNN'],

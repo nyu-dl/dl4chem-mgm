@@ -3,14 +3,15 @@ import os
 import sys
 
 import pandas as pd
+pd.set_option('display.max_rows', None)
 
 results_dir = sys.argv[1]
 
 results_list, hps = [], []
-max_num_iters = 10
+max_num_iters = 400
 incomplete_path = os.path.join(results_dir, 'distribution_results_{}_{}.json') 
 for n in range(1, max_num_iters+1):
-    for s in range(n+1):
+    for s in [n]:#range(n+1):
         a = n - s 
         complete_path = incomplete_path.format(s, a)
         if not os.path.exists(complete_path): continue

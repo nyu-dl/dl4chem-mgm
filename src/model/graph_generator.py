@@ -1,6 +1,4 @@
-import copy
-import os
-import pickle
+import os, pickle, json
 from collections import deque
 
 import numpy as np
@@ -14,7 +12,8 @@ from tqdm import tqdm
 
 from data.gen_targets import get_symbol_list
 from src.data.loader import SizeSampler
-from src.utils import set_seed_if, graph_to_mol, get_index_method, filter_top_k
+from src.utils import set_seed_if, graph_to_mol, get_index_method, filter_top_k, calculate_graph_properties,\
+    dct_to_cuda, dct_to_cpu
 
 if int(tf.__version__.split('.')[0]) <= 1:
     config = tf.ConfigProto()
@@ -37,7 +36,6 @@ class MockGenerator(DistributionMatchingGenerator):
 class GenDataset(Dataset):
     def __init__(self, dataset, number_samples):
         self.dataset = dataset
-        self.mol_nodeinds = self.dataset.mol_nodeinds # for SizeSampler
         self.number_samples = number_samples
 
     def __getitem__(self, index):
@@ -53,7 +51,7 @@ class GraphGenerator(DistributionMatchingGenerator):
                  maintain_minority_proportion=False, no_edge_present_type='learned', mask_independently=False,
                  one_property_per_loop=False, checkpointing_period=1, save_period=1, evaluation_period=1,
                  evaluate_finegrained=False, save_finegrained=False, variables_per_gibbs_iteration=1, top_k=-1,
-                 save_init=False):
+                 save_init=False, cond_property_values={}):
         super().__init__()
         self.model = model
         self.generation_algorithm = generation_algorithm
@@ -89,20 +87,21 @@ class GraphGenerator(DistributionMatchingGenerator):
         self.model_forward = self.model_forward_cgvae if self.model.__class__.__name__ == 'CGVAE' \
                                                       else self.model_forward_mgm
 
-        self.node_int = 1
-        self.edge_int = 2
         if self.one_property_per_loop is True:
-            self.hydrogen_int, self.charge_int, self.is_in_ring_int, self.is_aromatic_int, self.chirality_int = \
-                tuple(range(3, 8))
+            self.node_property_ints = {'node_type': 1, 'hydrogens': 2, 'charge': 3, 'is_in_ring': 4, 'is_aromatic': 5,
+                                       'chirality': 6}
+            self.edge_property_ints = {'edge_type': 7}
         else:
-            self.hydrogen_int = self.charge_int = self.is_in_ring_int = self.is_aromatic_int = self.chirality_int = \
-                self.node_int
+            self.node_property_ints = {'node_type': 1, 'hydrogens': 1, 'charge': 1, 'is_in_ring': 1, 'is_aromatic': 1,
+                                       'chirality': 1}
+            self.edge_property_ints = {'edge_type': 2}
+
+        self.cond_property_values = {k: float(v) for k, v in cond_property_values.items()}
 
     def generate(self, number_samples):
         load_path, load_iters = get_load_path(self.num_sampling_iters, self.num_argmax_iters, self.cp_save_dir)
-        all_init_nodes, all_init_edges, all_node_masks, all_edge_masks, all_init_hydrogens, all_init_charge, \
-        all_init_is_in_ring, all_init_is_aromatic, all_init_chirality = self.get_all_init_variables(load_path,
-                                                                                            number_samples)
+        all_init_node_properties, all_init_edge_properties, all_node_masks, all_edge_masks = \
+            self.get_all_init_variables(load_path, number_samples)
 
         if self.set_seed_at_load_iter is True:
             set_seed_if(load_iters)
@@ -113,13 +112,11 @@ class GraphGenerator(DistributionMatchingGenerator):
                 retrieve_train_graphs = False
                 if self.generation_algorithm == 'Gibbs':
                     self.train_data.do_not_corrupt = True
-            loader = self.get_dataloader(all_init_nodes, all_init_edges, all_node_masks,
-                                         all_init_hydrogens, all_init_charge, all_init_is_in_ring, all_init_is_aromatic,
-                                         all_init_chirality, number_samples, retrieve_train_graphs)
+            loader = self.get_dataloader(all_init_node_properties, all_node_masks, all_init_edge_properties,
+                                         number_samples, retrieve_train_graphs)
 
             use_argmax = (j >= self.num_sampling_iters)
-            all_init_nodes, all_init_edges, all_init_hydrogens, all_init_charge, all_init_is_in_ring,\
-                all_init_is_aromatic, all_init_chirality, all_node_masks,\
+            all_init_node_properties, all_init_edge_properties, all_node_masks, \
                 smiles_list = self.carry_out_iteration(loader, use_argmax)
 
         return smiles_list
@@ -128,20 +125,19 @@ class GraphGenerator(DistributionMatchingGenerator):
                                  num_samples_to_evaluate, evaluate_connected_only=False):
 
         load_path, load_iters = get_load_path(self.num_sampling_iters, self.num_argmax_iters, self.cp_save_dir)
-        all_init_nodes, all_init_edges, all_node_masks, all_edge_masks, all_init_hydrogens, all_init_charge, \
-        all_init_is_in_ring, all_init_is_aromatic, all_init_chirality = self.get_all_init_variables(load_path,
-                                                                                            num_samples_to_generate)
+        all_init_node_properties, all_init_edge_properties, all_node_masks, all_edge_masks = \
+            self.get_all_init_variables(load_path, num_samples_to_generate)
 
         if self.save_init is True and self.random_init is True and load_iters == 0:
             # Save smiles representations of initialised molecules
             smiles_list = []
             num_nodes = all_node_masks.sum(-1)
-            for i in range(len(all_init_nodes)):
-                mol = graph_to_mol(all_init_nodes[i, :int(num_nodes[i])].astype(int),
-                                   all_init_edges[i, :int(num_nodes[i]), :int(num_nodes[i])].astype(int),
-                                   all_init_charge[i, :int(num_nodes[i])].astype(int),
-                                   all_init_chirality[i, :int(num_nodes[i])].astype(int),
-                                   min_charge=self.min_charge, symbol_list=self.symbol_list)
+            for i in range(len(all_init_node_properties['node_type'])):
+                mol = graph_to_mol({k: v[i][:int(num_nodes[i])].astype(int) \
+                                    for k, v in all_init_node_properties.items()},
+                                   {k: v[i][:int(num_nodes[i]), :int(num_nodes[i])].astype(int) \
+                                    for k, v in all_init_edge_properties.items()},
+                                   min_charge=self.train_data.min_charge, symbol_list=self.symbol_list)
                 smiles_list.append(Chem.MolToSmiles(mol))
             save_smiles_list(smiles_list, os.path.join(output_dir, 'smiles_0_0.txt'))
             del smiles_list, mol, num_nodes
@@ -155,20 +151,17 @@ class GraphGenerator(DistributionMatchingGenerator):
                 retrieve_train_graphs = False
                 if self.generation_algorithm == 'Gibbs':
                     self.train_data.do_not_corrupt = True
-            loader = self.get_dataloader(all_init_nodes, all_init_edges, all_node_masks,
-                                         all_init_hydrogens, all_init_charge, all_init_is_in_ring, all_init_is_aromatic,
-                                         all_init_chirality, num_samples_to_generate, retrieve_train_graphs)
+            loader = self.get_dataloader(all_init_node_properties, all_node_masks, all_init_edge_properties,
+                                         num_samples_to_generate, retrieve_train_graphs)
 
             use_argmax = (j >= self.num_sampling_iters)
-            all_init_nodes, all_init_edges, all_init_hydrogens, all_init_charge, all_init_is_in_ring,\
-                all_init_is_aromatic, all_init_chirality, all_node_masks,\
+            all_init_node_properties, all_init_edge_properties, all_node_masks,\
                 smiles_list = self.carry_out_iteration(loader, use_argmax)
 
             sampling_iters_completed = min(j + 1, self.num_sampling_iters)
             argmax_iters_completed = max(0, j + 1 - self.num_sampling_iters)
             if (j + 1 - load_iters) % self.checkpointing_period == 0:
-                self.save_checkpoints(all_init_nodes, all_init_edges, all_init_hydrogens, all_init_charge,
-                                  all_init_is_in_ring, all_init_is_aromatic, all_init_chirality,
+                self.save_checkpoints(all_init_node_properties, all_init_edge_properties,
                                   sampling_iters_completed, argmax_iters_completed)
 
             if (j + 1 - load_iters) % self.save_period == 0 or (self.save_finegrained is True and (j + 1) <= 10):
@@ -183,89 +176,85 @@ class GraphGenerator(DistributionMatchingGenerator):
                 evaluate_uncond_generation(MockGenerator(smiles_list, num_samples_to_generate),
                                                     smiles_dataset_path, json_output_path, num_samples_to_evaluate,
                                                     evaluate_connected_only)
+                if self.cond_property_values:
+                    cond_json_output_path = os.path.join(output_dir, 'cond_results_{}_{}.json'.format(
+                                                            sampling_iters_completed, argmax_iters_completed))
+                    self.evaluate_cond_generation(smiles_list[:num_samples_to_evaluate], cond_json_output_path)
 
 
     def carry_out_iteration(self, loader, use_argmax):
         mols, smiles_list = [], []
-        all_final_nodes, all_final_edges, all_final_hydrogens, all_final_charge, all_final_is_in_ring, \
-            all_final_is_aromatic, all_final_chirality, all_final_node_masks = [], [], [], [], [], [], [], []
+        all_final_node_properties = {name: [] for name in self.train_data.node_property_names}
+        all_final_edge_properties = {name: [] for name in self.train_data.edge_property_names}
+        all_final_node_masks = []
         print('Generator length: {}'.format(len(loader)), flush=True)
-        for init_nodes, init_edges, orig_nodes, orig_edges, node_masks, edge_masks, node_target_types,\
-            edge_target_types, init_hydrogens, orig_hydrogens, init_charge, orig_charge, init_is_in_ring,\
-            orig_is_in_ring, init_is_aromatic, orig_is_aromatic, init_chirality, orig_chirality, \
-            hydrogen_target_types, charge_target_types, is_in_ring_target_types, is_aromatic_target_types, \
-            chirality_target_types in tqdm(loader):
+        for init_node_properties, orig_node_properties, node_property_target_types, node_mask, \
+            init_edge_properties, orig_edge_properties, edge_property_target_types, edge_mask, \
+            graph_properties in tqdm(loader):
             if self.local_cpu is False:
-                init_nodes = init_nodes.cuda(); init_edges = init_edges.cuda(); init_hydrogens = init_hydrogens.cuda()
-                init_charge = init_charge.cuda(); init_is_in_ring = init_is_in_ring.cuda()
-                init_is_aromatic = init_is_aromatic.cuda(); init_chirality = init_chirality.cuda()
-                node_masks = node_masks.cuda(); edge_masks = edge_masks.cuda()
+                init_node_properties = dct_to_cuda(init_node_properties)
+                node_mask = node_mask.cuda()
+                init_edge_properties = dct_to_cuda(init_edge_properties)
+                edge_mask = edge_mask.cuda()
+                graph_properties = dct_to_cuda(graph_properties)
 
             if self.generation_algorithm == 'gibbs':
-                init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic, init_chirality \
-                                                        = self.carry_out_gibbs_sampling_sweeps(init_nodes, init_edges,
-                                                        init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic,
-                                                        init_chirality, node_masks, edge_masks, use_argmax)
+                init_node_properties, init_edge_properties = self.carry_out_gibbs_sampling_sweeps(init_node_properties,
+                                                                init_edge_properties, node_mask, edge_mask,
+                                                                graph_properties, use_argmax)
             elif self.generation_algorithm == 'simultaneous':
-                init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic, init_chirality \
-                                                        = self.sample_simultaneously(init_nodes, init_edges,
-                                                        init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic,
-                                                        init_chirality, node_masks, edge_masks, node_target_types,
-                                                        edge_target_types, hydrogen_target_types, charge_target_types,
-                                                        is_in_ring_target_types, is_aromatic_target_types,
-                                                        chirality_target_types, use_argmax)
+                init_node_properties, init_edge_properties = self.sample_simultaneously(init_node_properties,
+                                                    init_edge_properties, node_mask, edge_mask,
+                                                    node_property_target_types, edge_property_target_types,
+                                                    graph_properties, use_argmax)
 
-            init_nodes = init_nodes.cpu(); init_edges = init_edges.cpu(); init_hydrogens = init_hydrogens.cpu()
-            init_charge = init_charge.cpu(); init_is_in_ring = init_is_in_ring.cpu()
-            init_is_aromatic = init_is_aromatic.cpu(); init_chirality = init_chirality.cpu()
-            node_masks = node_masks.cpu(); edge_masks = edge_masks.cpu()
+            init_node_properties = dct_to_cpu(init_node_properties)
+            init_edge_properties = dct_to_cpu(init_edge_properties)
+            node_mask = node_mask.cpu()
+            del edge_mask
 
-            self.append_and_convert_graphs(init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring,
-                        init_is_aromatic, init_chirality, node_masks, all_final_nodes, all_final_edges,
-                        all_final_hydrogens, all_final_charge, all_final_is_in_ring, all_final_is_aromatic,
-                        all_final_chirality, all_final_node_masks, mols, smiles_list)
+            self.append_and_convert_graphs(init_node_properties, init_edge_properties, node_mask,
+                                           all_final_node_properties, all_final_edge_properties, all_final_node_masks,
+                                           mols, smiles_list)
         
-        return all_final_nodes, all_final_edges, all_final_hydrogens, all_final_charge, all_final_is_in_ring, \
-               all_final_is_aromatic, all_final_chirality, all_final_node_masks, smiles_list
+        return all_final_node_properties, all_final_edge_properties, all_final_node_masks, smiles_list
 
     def get_all_init_variables(self, load_path, number_samples):
         if load_path is not None:
             with open(load_path, 'rb') as f:
                 load_info = pickle.load(f)
-            if self.model.embed_hs is True:
-                all_init_nodes, all_init_edges, all_init_hydrogens, all_init_charge, \
-                    all_init_is_in_ring, all_init_is_aromatic, all_init_chirality = load_info
-            else:
-                all_init_nodes, all_init_edges = load_info
-            all_node_masks = [(init_nodes != self.node_empty_index) for init_nodes in all_init_nodes]
-            all_edge_masks = [(init_edges != self.edge_empty_index) for init_edges in all_init_edges]
+            all_init_node_properties, all_init_edge_properties = load_info
+            all_node_masks = [(node_type != self.train_data.node_properties['node_type']['empty_index']) \
+                              for node_type in all_init_node_properties['node_type']]
+            all_edge_masks = [(edge_type != self.train_data.edge_properties['edge_type']['empty_index']) \
+                              for edge_type in all_init_edge_properties['edge_type']]
         else:
             lengths = self.sample_lengths(number_samples)
-            all_init_nodes, all_init_edges, all_node_masks, all_edge_masks, all_init_hydrogens, all_init_charge,\
-                all_init_is_in_ring, all_init_is_aromatic, all_init_chirality = self.get_masked_variables(lengths,
-                number_samples, self.train_data.num_node_types, self.train_data.num_edge_types, self.edges_per_batch<=0)
-        return all_init_nodes, all_init_edges, all_node_masks, all_edge_masks, all_init_hydrogens, all_init_charge,\
-                all_init_is_in_ring, all_init_is_aromatic, all_init_chirality
+            all_init_node_properties, all_init_edge_properties, all_node_masks, all_edge_masks = \
+                self.get_masked_variables(lengths, number_samples, self.edges_per_batch <= 0)
+        return all_init_node_properties, all_init_edge_properties, all_node_masks, all_edge_masks
 
-    def get_dataloader(self, all_init_nodes, all_init_edges, all_node_masks, all_init_hydrogens,
-                       all_init_charge, all_init_is_in_ring, all_init_is_aromatic, all_init_chirality, number_samples,
+    def get_dataloader(self, all_init_node_properties, all_node_masks, all_init_edge_properties, number_samples,
                        retrieve_train_graphs):
         gen_dataset = GenDataset(self.train_data, number_samples)
         if retrieve_train_graphs is False:
-            gen_dataset.dataset.mol_nodeinds = [init_nodes[:int(all_node_masks[i].sum())]
-                                            for i, init_nodes in enumerate(all_init_nodes)]
-            gen_dataset.dataset.num_hs = [init_hydrogens[:int(all_node_masks[i].sum())]
-                                            for i, init_hydrogens in enumerate(all_init_hydrogens)]
-            gen_dataset.dataset.charge = [init_charge[:int(all_node_masks[i].sum())] - abs(self.min_charge)
-                                         for i, init_charge in enumerate(all_init_charge)]
-            gen_dataset.dataset.is_in_ring = [init_is_in_ring[:int(all_node_masks[i].sum())]
-                                         for i, init_is_in_ring in enumerate(all_init_is_in_ring)]
-            gen_dataset.dataset.is_aromatic = [init_is_aromatic[:int(all_node_masks[i].sum())]
-                                         for i, init_is_aromatic in enumerate(all_init_is_aromatic)]
-            gen_dataset.dataset.chirality = [init_chirality[:int(all_node_masks[i].sum())]
-                                         for i, init_chirality in enumerate(all_init_chirality)]
-            gen_dataset.dataset.adj_mats = [init_edges[:int(all_node_masks[i].sum()), :int(all_node_masks[i].sum())]
-                                        for i, init_edges in enumerate(all_init_edges)]
+            for name, node_property in all_init_node_properties.items():
+                data = []
+                for i, single_data_property in enumerate(node_property):
+                    if name == 'charge': single_data_property -= abs(self.train_data.min_charge)
+                    data.append(single_data_property[:int(all_node_masks[i].sum())])
+                gen_dataset.dataset.node_properties[name]['data'] = data
+
+            for name, edge_property in all_init_edge_properties.items():
+                data = []
+                for i, single_data_property in enumerate(edge_property):
+                    data.append(single_data_property[:int(all_node_masks[i].sum()), :int(all_node_masks[i].sum())])
+                gen_dataset.dataset.edge_properties[name]['data'] = data
+
+        for name, value in self.cond_property_values.items():
+            gen_dataset.dataset.graph_properties[name] = np.ones_like(gen_dataset.dataset.graph_properties[name]) \
+                                                         * value
+
         if self.edges_per_batch > 0:
             batch_sampler = SizeSampler(gen_dataset, self.edges_per_batch)
             batch_sampler.batches.reverse()
@@ -274,182 +263,134 @@ class GraphGenerator(DistributionMatchingGenerator):
             loader = DataLoader(gen_dataset, batch_size=self.batch_size)
         return loader
 
-    def carry_out_gibbs_sampling_sweeps(self, init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring,
-                                       init_is_aromatic, init_chirality, node_masks, edge_masks, use_argmax):
-        init_nodes_copy = copy.deepcopy(init_nodes.cpu())
+    def carry_out_gibbs_sampling_sweeps(self, init_node_properties, init_edge_properties, node_mask, edge_mask,
+                                        graph_properties, use_argmax):
         if self.edges_per_batch > 0:
-            max_nodes = len(init_nodes[0])
+            max_nodes = len(init_node_properties['node_type'][0])
             max_edges = int(max_nodes * (max_nodes - 1) / 2)
         else:
             max_nodes, max_edges = self.max_nodes, self.max_edges
-        num_nodes = node_masks.sum(-1)
-        unique_edge_coords, num_unique_edges, generation_arrays, nodes_arrays, edges_arrays = \
-            self.get_unshuffled_update_order_arrays(len(init_nodes), num_nodes)
+        num_nodes = node_mask.sum(-1)
+        unique_edge_coords, num_unique_edges, generation_arrays, node_property_arrays, edge_property_arrays = \
+            self.get_unshuffled_update_order_arrays(len(init_node_properties['node_type']), num_nodes)
 
         max_num_components = max_nodes + max_edges
         if self.one_property_per_loop is True:
-            num_properties = 5
-            max_num_components += num_properties * max_nodes
+            max_num_components = len(self.node_property_ints.keys()) * max_nodes + \
+                                 len(self.edge_property_ints.keys()) * max_edges
         generation_queue = deque(get_shuffled_array(generation_arrays, max_num_components).transpose())
-        nodes_queues = self.get_shuffled_queues(nodes_arrays, max_nodes)
-        edges_queues = self.get_shuffled_queues(edges_arrays, max_edges)
-        if self.mask_independently is True:
-            hydrogen_queues = self.get_shuffled_queues(nodes_arrays, max_nodes)
-            charge_queues = self.get_shuffled_queues(nodes_arrays, max_nodes)
-            is_in_ring_queues = self.get_shuffled_queues(nodes_arrays, max_nodes)
-            is_aromatic_queues = self.get_shuffled_queues(nodes_arrays, max_nodes)
-            chirality_queues = self.get_shuffled_queues(nodes_arrays, max_nodes)
+        node_property_queues = {name: self.get_shuffled_queues(arrays, max_nodes) \
+                                for name, arrays in node_property_arrays.items()}
+        edge_property_queues = {name: self.get_shuffled_queues(arrays, max_edges) \
+                                for name, arrays in edge_property_arrays.items()}
         with torch.no_grad():
             while len(generation_queue) > 0:
                 next_target_types = [generation_queue.popleft() \
                                      for _ in range(min(len(generation_queue), self.variables_per_gibbs_iteration))]
                 next_target_types = np.vstack(next_target_types)
 
-                node_update_graphs = np.where(next_target_types == self.node_int)[1]
-                edge_update_graphs = np.where(next_target_types == self.edge_int)[1]
+                node_property_update_graphs = {name: np.where(next_target_types == property_int)[1] \
+                                               for name, property_int in self.node_property_ints.items()}
+                edge_property_update_graphs = {name: np.where(next_target_types == property_int)[1] \
+                                               for name, property_int in self.edge_property_ints.items()}
 
                 # replace nodes, node properties and edges
-                nodes_to_update = [nodes_queues[ind].popleft() for ind in node_update_graphs]
-                edges_to_update = [edges_queues[ind].popleft() for ind in edge_update_graphs]
-                if self.mask_independently is True:
-                    hydrogen_update_graphs = np.where(next_target_types == self.hydrogen_int)[1]
-                    charge_update_graphs = np.where(next_target_types == self.charge_int)[1]
-                    is_in_ring_update_graphs = np.where(next_target_types == self.is_in_ring_int)[1]
-                    is_aromatic_update_graphs = np.where(next_target_types == self.is_aromatic_int)[1]
-                    chirality_update_graphs = np.where(next_target_types == self.chirality_int)[1]
-                    hydrogens_to_update = [hydrogen_queues[ind].popleft() for ind in hydrogen_update_graphs]
-                    charge_to_update = [charge_queues[ind].popleft() for ind in charge_update_graphs]
-                    is_in_ring_to_update = [is_in_ring_queues[ind].popleft() for ind in is_in_ring_update_graphs]
-                    is_aromatic_to_update = [is_aromatic_queues[ind].popleft() for ind in is_aromatic_update_graphs]
-                    chirality_to_update = [chirality_queues[ind].popleft() for ind in chirality_update_graphs]
-                else:
-                    hydrogens_to_update = charge_to_update = is_in_ring_to_update = is_aromatic_to_update = \
-                        chirality_to_update = nodes_to_update
+                nodes_to_update = {name: node_property_queues[name][ind].popleft() \
+                                        for name, property_update_graphs in node_property_update_graphs.items() \
+                                        for ind in property_update_graphs}
+                edges_to_update = {name: edge_property_queues[name][ind].popleft() \
+                                   for name, property_update_graphs in edge_property_update_graphs.items() \
+                                   for ind in property_update_graphs}
 
                 if self.mask_comp_to_predict is True:
-                    self.mask_one_entry_per_graph(init_nodes, init_edges, init_hydrogens,
-                                                  init_charge, init_is_in_ring, init_is_aromatic, init_chirality,
-                                                  node_update_graphs, edge_update_graphs,
-                                                  hydrogen_update_graphs, charge_update_graphs,
-                                                  is_in_ring_update_graphs, is_aromatic_update_graphs,
-                                                  chirality_update_graphs,
-                                                  nodes_to_update, edges_to_update,
-                                                  hydrogens_to_update, charge_to_update, is_in_ring_to_update,
-                                                  is_aromatic_to_update, chirality_to_update,
-                                                  node_masks, edge_masks)
+                    self.mask_one_entry_per_graph(init_node_properties, init_edge_properties,
+                                                  node_property_update_graphs, edge_property_update_graphs,
+                                                  nodes_to_update, edges_to_update, node_mask, edge_mask)
 
-                node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores, is_aromatic_scores, \
-                                        chirality_scores = self.model_forward(init_nodes, init_edges,
-                                                            node_masks, edge_masks, init_hydrogens, init_charge,
-                                                            init_is_in_ring, init_is_aromatic, init_chirality)
+                node_property_scores, edge_property_scores, graph_property_scores = self.model_forward(
+                    init_node_properties, init_edge_properties, node_mask, edge_mask, graph_properties)
 
-                if self.maintain_minority_proportion is True:
-                    self.drop_minority_loc_majority_scores(init_nodes_copy, node_scores)
+                node_property_preds, edge_property_preds = self.predict_from_scores(node_property_scores,
+                                                                                    edge_property_scores, use_argmax)
 
-                node_preds, edge_preds, hydrogen_preds, charge_preds, is_in_ring_preds, is_aromatic_preds,\
-                    chirality_preds = self.predict_from_scores(node_scores, edge_scores, hydrogen_scores,
-                                        charge_scores, is_in_ring_scores, is_aromatic_scores, chirality_scores,
-                                        use_argmax)
+                init_node_properties, init_edge_properties = self.update_components(
+                        nodes_to_update, edges_to_update, init_node_properties, init_edge_properties,
+                        node_property_update_graphs, edge_property_update_graphs,
+                        node_property_preds, edge_property_preds)
 
-                init_nodes, init_edges, init_hydrogens, \
-                    init_charge, init_is_in_ring, init_is_aromatic, init_chirality, = self.update_components(
-                        nodes_to_update, edges_to_update, hydrogens_to_update, charge_to_update,
-                        is_in_ring_to_update, is_aromatic_to_update, chirality_to_update,
-                        init_nodes, init_edges, init_hydrogens,
-                        init_charge, init_is_in_ring, init_is_aromatic, init_chirality,
-                        node_update_graphs, edge_update_graphs, hydrogen_update_graphs, charge_update_graphs,
-                        is_in_ring_update_graphs, is_aromatic_update_graphs, chirality_update_graphs,
-                        node_preds, edge_preds, hydrogen_preds,
-                        charge_preds, is_in_ring_preds, is_aromatic_preds, chirality_preds)
+        return init_node_properties, init_edge_properties
 
-        return init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic, init_chirality
-
-    def sample_simultaneously(self, init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring,
-                              init_is_aromatic, init_chirality, node_masks, edge_masks, node_target_types,
-                              edge_target_types, hydrogen_target_types, charge_target_types, is_in_ring_target_types,
-                              is_aromatic_target_types, chirality_target_types, use_argmax):
+    def sample_simultaneously(self, init_node_properties, init_edge_properties, node_mask, edge_mask,
+                                node_property_target_types, edge_property_target_types, graph_properties=None,
+                                use_argmax=False):
         with torch.no_grad():
-            node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores, is_aromatic_scores,\
-                chirality_scores, = self.model_forward(init_nodes, init_edges, node_masks,
-                                    edge_masks, init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic,
-                                    init_chirality)
-        node_preds, edge_preds, hydrogen_preds, charge_preds, is_in_ring_preds, is_aromatic_preds,\
-                    chirality_preds = self.predict_from_scores(node_scores, edge_scores, hydrogen_scores,
-                                    charge_scores, is_in_ring_scores, is_aromatic_scores, chirality_scores, use_argmax)
+            node_property_scores, edge_property_scores, graph_property_scores = self.model_forward(
+                init_node_properties, init_edge_properties, node_mask, edge_mask, graph_properties)
+        node_property_preds, edge_property_preds = self.predict_from_scores(node_property_scores, edge_property_scores,
+                                                                            use_argmax)
 
-        init_nodes[node_target_types != 0] = node_preds[node_target_types != 0]
-        edge_target_coords = np.where(edge_target_types != 0)
-        init_edges[edge_target_coords] = edge_preds[edge_target_coords]
-        init_edges[edge_target_coords[0], edge_target_coords[2], edge_target_coords[1]] = edge_preds[edge_target_coords]
-        init_hydrogens[hydrogen_target_types != 0] = hydrogen_preds[hydrogen_target_types != 0]
-        init_charge[charge_target_types != 0] = charge_preds[charge_target_types != 0]
-        init_is_in_ring[is_in_ring_target_types != 0] = is_in_ring_preds[is_in_ring_target_types != 0]
-        init_is_aromatic[is_aromatic_target_types != 0] = is_aromatic_preds[is_aromatic_target_types != 0]
-        init_chirality[chirality_target_types != 0] = chirality_preds[chirality_target_types != 0]
+        for name, node_property in init_node_properties.items():
+            targets = node_property_target_types[name] != 0
+            node_property[targets] = node_property_preds[name][targets]
 
-        return init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic, init_chirality
+        for name, edge_property in init_edge_properties.items():
+            target_coords = np.where(edge_property_target_types[name] != 0)
+            edge_property[target_coords] = edge_property_preds[name][target_coords]
+            edge_property[target_coords[0], target_coords[2], target_coords[1]] = \
+                edge_property_preds[name][target_coords]
+
+        return init_node_properties, init_edge_properties
 
     def get_unshuffled_update_order_arrays(self, batch_size, num_nodes):
-        unique_edge_coords, num_unique_edges, generation_arrays, nodes_arrays, edges_arrays = [], [], [], [], []
+        unique_edge_coords, num_unique_edges, generation_arrays = [], [], []
+        node_property_arrays = {name: [] for name in self.node_property_ints.keys()}
+        edge_property_arrays = {name: [] for name in self.edge_property_ints.keys()}
         for i in range(batch_size):
             unique_edge_coords.append(list(zip(*np.triu_indices(num_nodes[i], k=1))))
             num_unique_edges.append(len(unique_edge_coords[i]))
-            if self.one_property_per_loop is True:
-                generation_array = np.array([self.node_int] * int(num_nodes[i]) +
-                                [self.edge_int] * int(num_unique_edges[i]) +
-                                [self.hydrogen_int] * int(num_nodes[i]) + [self.charge_int] * int(num_nodes[i]) +
-                                [self.is_in_ring_int] * int(num_nodes[i]) + [self.is_aromatic_int] * int(num_nodes[i]) +
-                                [self.chirality_int] * int(num_nodes[i]))
+            generation_array = []
+            for name, npi in self.node_property_ints.items():
+                if self.one_property_per_loop is True: # or self.mask_independently is True ?
+                    generation_array.extend([npi] * int(num_nodes[i]))
+                else:
+                    generation_array.extend([self.node_property_ints['node_type']] * int(num_nodes[i]))
+                node_property_arrays[name].append(np.arange(int(num_nodes[i])))
+            for name, epi in self.edge_property_ints.items():
+                generation_array.extend([epi] * int(num_unique_edges[i]))
+                edge_property_arrays[name].append(unique_edge_coords[i])
             else:
-                generation_array = np.array([self.node_int] * int(num_nodes[i]) +
-                                            [self.edge_int] * int(num_unique_edges[i]))
+                generation_array = np.array([self.node_property_ints['node_type']] * int(num_nodes[i]) +
+                                            [self.edge_property_ints['edge_type']] * int(num_unique_edges[i]))
             generation_arrays.append(generation_array)
-            nodes_arrays.append(np.arange(int(num_nodes[i])))
-            edges_arrays.append(unique_edge_coords[i])
-        return unique_edge_coords, num_unique_edges, generation_arrays, nodes_arrays, edges_arrays
+        return unique_edge_coords, num_unique_edges, generation_arrays, node_property_arrays, edge_property_arrays
 
     def get_shuffled_queues(self, array_to_shuffle, max_num_components):
         shuffled_array = get_shuffled_array(array_to_shuffle, max_num_components)
         queues = [deque(array) for array in shuffled_array]
         return queues
 
-    def mask_one_entry_per_graph(self, init_nodes, init_edges, init_hydrogens,
-                                 init_charge, init_is_in_ring, init_is_aromatic, init_chirality,
-                                 node_update_graphs, edge_update_graphs, hydrogen_update_graphs, charge_update_graphs,
-                                 is_in_ring_update_graphs, is_aromatic_update_graphs, chirality_update_graphs,
-                                 nodes_to_update, edges_to_update, hydrogens_to_update, charge_to_update,
-                                 is_in_ring_to_update, is_aromatic_to_update, chirality_to_update,
-                                 node_masks, edge_masks):
-        if nodes_to_update:
-            init_nodes[node_update_graphs, nodes_to_update] = self.node_mask_index
-            if self.no_edge_present_type == 'zeros':
-                node_masks[node_update_graphs, nodes_to_update] = 1
-        if hydrogens_to_update:
-            init_hydrogens[hydrogen_update_graphs, hydrogens_to_update] = self.h_mask_index
-        if charge_to_update:
-            init_charge[charge_update_graphs, charge_to_update] = self.charge_mask_index
-        if is_in_ring_to_update:
-            init_is_in_ring[is_in_ring_update_graphs, is_in_ring_to_update] = self.is_in_ring_mask_index
-        if is_aromatic_to_update:
-            init_is_aromatic[is_aromatic_update_graphs, is_aromatic_to_update] = self.is_aromatic_mask_index
-        if chirality_to_update:
-            init_chirality[chirality_update_graphs, chirality_to_update] = self.chirality_mask_index
-        if edges_to_update:
-            coords_array = np.array(edges_to_update).transpose()
-            init_edges[edge_update_graphs, coords_array[0], coords_array[1]] = init_edges[edge_update_graphs,
-                                                                                        coords_array[1], coords_array[
-                                                                                        0]] = self.edge_mask_index
-            if self.no_edge_present_type == 'zeros':
-                edge_masks[edge_update_graphs, coords_array[0], coords_array[1]] = edge_masks[edge_update_graphs,
-                                                                coords_array[0], coords_array[1]] = 1
+    def mask_one_entry_per_graph(self, init_node_properties, init_edge_properties,
+                                 node_property_update_graphs, edge_property_update_graphs,
+                                 nodes_to_update, edges_to_update, node_mask, edge_mask):
+        for name in nodes_to_update.keys():
+            if nodes_to_update[name]:
+                init_node_properties[name][node_property_update_graphs[name], nodes_to_update[name]] = \
+                    self.train_data.node_properties[name]['mask_index']
+                if self.no_edge_present_type == 'zeros':
+                    node_mask[node_property_update_graphs[name], nodes_to_update[name]] = 1
+        for name in edges_to_update.keys():
+            if edges_to_update[name]:
+                coords_array = np.array(edges_to_update[name]).transpose()
+                init_edge_properties[edge_property_update_graphs[name], coords_array[0], coords_array[1]] = \
+                    init_edge_properties[edge_property_update_graphs[name], coords_array[1], coords_array[0]] = \
+                    self.train_data.edge_properties['edge_type']['mask_index']
+                if self.no_edge_present_type == 'zeros':
+                    edge_mask[edge_property_update_graphs[name], coords_array[0], coords_array[1]] = \
+                        edge_mask[edge_property_update_graphs[name], coords_array[1], coords_array[0]] = 1
 
-    def model_forward_mgm(self, init_nodes, init_edges, node_masks, edge_masks, init_hydrogens, init_charge,
-                                init_is_in_ring, init_is_aromatic, init_chirality):
-        node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores, is_aromatic_scores, \
-                chirality_scores = self.model(init_nodes, init_edges, node_masks, edge_masks, init_hydrogens,
-                                              init_charge, init_is_in_ring, init_is_aromatic, init_chirality)
-        return node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores, is_aromatic_scores, \
-                chirality_scores
+    def model_forward_mgm(self, init_node_properties, init_edge_properties, node_mask, edge_mask,
+                          graph_properties=None):
+        return self.model(init_node_properties, node_mask, init_edge_properties, edge_mask, graph_properties)
 
     def model_forward_cgvae(self, init_nodes, init_edges, node_masks, edge_masks, init_hydrogens):
         node_target_inds_vector = getattr(init_nodes == self.node_mask_index, self.index_method)()
@@ -465,107 +406,69 @@ class GraphGenerator(DistributionMatchingGenerator):
         node_scores[list(minority_node_locs) +
                     [np.ones_like(minority_node_locs[0]) * majority_node_index]] = -9999
 
-    def predict_from_scores(self, node_scores, edge_scores, hydrogen_scores, charge_scores, is_in_ring_scores,
-                            is_aromatic_scores, chirality_scores,use_argmax=False):
+    def predict_from_scores(self, node_property_scores, edge_property_scores, use_argmax=False):
         if use_argmax is True:
-            node_preds = torch.argmax(F.softmax(node_scores, -1), dim=-1)
-            edge_preds = torch.argmax(F.softmax(edge_scores, -1), dim=-1)
-            hydrogen_preds = torch.argmax(F.softmax(hydrogen_scores, -1), dim=-1)
-            charge_preds = torch.argmax(F.softmax(charge_scores, -1), dim=-1)
-            is_in_ring_preds = torch.argmax(F.softmax(is_in_ring_scores, -1), dim=-1)
-            is_aromatic_preds = torch.argmax(F.softmax(is_aromatic_scores, -1), dim=-1)
-            chirality_preds = torch.argmax(F.softmax(chirality_scores, -1), dim=-1)
+            node_property_preds = {name: torch.argmax(F.softmax(scores, -1), dim=-1) \
+                                   for name, scores in node_property_scores.items()}
+            edge_property_preds = {name: torch.argmax(F.softmax(scores, -1), dim=-1) \
+                                   for name, scores in edge_property_scores.items()}
         else:
-            if self.top_k > 0:
-                node_scores = filter_top_k(node_scores, self.top_k)
-                edge_scores = filter_top_k(edge_scores, self.top_k)
-                hydrogen_scores = filter_top_k(hydrogen_scores, self.top_k)
-                charge_scores = filter_top_k(charge_scores, self.top_k)
-                is_in_ring_scores = filter_top_k(is_in_ring_scores, self.top_k)
-                is_aromatic_scores = filter_top_k(is_aromatic_scores, self.top_k)
-                chirality_scores = filter_top_k(chirality_scores, self.top_k)
+            node_property_preds, edge_property_preds = {}, {}
+            for name, scores in node_property_scores.items():
+                if self.top_k > 0:
+                    scores = filter_top_k(scores, self.top_k)
+                node_property_preds[name] = torch.distributions.Categorical(F.softmax(scores, -1)).sample()
 
-            node_preds = torch.distributions.Categorical(F.softmax(node_scores, -1)).sample()
-            edge_preds = torch.distributions.Categorical(F.softmax(edge_scores, -1)).sample()
-            hydrogen_preds = torch.distributions.Categorical(F.softmax(hydrogen_scores, -1)).sample()
-            charge_preds = torch.distributions.Categorical(F.softmax(charge_scores, -1)).sample()
-            is_in_ring_preds = torch.distributions.Categorical(F.softmax(is_in_ring_scores, -1)).sample()
-            is_aromatic_preds = torch.distributions.Categorical(F.softmax(is_aromatic_scores, -1)).sample()
-            chirality_preds = torch.distributions.Categorical(F.softmax(chirality_scores, -1)).sample()
-        return node_preds, edge_preds, hydrogen_preds, charge_preds, is_in_ring_preds, is_aromatic_preds, \
-               chirality_preds
+            for name, scores in edge_property_scores.items():
+                if self.top_k > 0:
+                    scores = filter_top_k(scores, self.top_k)
+                edge_property_preds[name] = torch.distributions.Categorical(F.softmax(scores, -1)).sample()
 
-    def update_components(self, nodes_to_update, edges_to_update, hydrogens_to_update,
-                          charge_to_update, is_in_ring_to_update,  is_aromatic_to_update, chirality_to_update,
-                          init_nodes, init_edges, init_hydrogens,
-                          init_charge, init_is_in_ring, init_is_aromatic, init_chirality,
-                          node_update_graphs, edge_update_graphs, hydrogen_update_graphs, charge_update_graphs,
-                          is_in_ring_update_graphs, is_aromatic_update_graphs, chirality_update_graphs,
-                          node_preds, edge_preds, hydrogen_preds,
-                          charge_preds, is_in_ring_preds, is_aromatic_preds, chirality_preds):
-        if nodes_to_update:
-            init_nodes[node_update_graphs, nodes_to_update] = node_preds[node_update_graphs, nodes_to_update]
-        if hydrogens_to_update:
-            init_hydrogens[hydrogen_update_graphs, hydrogens_to_update] = \
-                hydrogen_preds[hydrogen_update_graphs, hydrogens_to_update]
-        if charge_to_update:
-            init_charge[charge_update_graphs, charge_to_update] = charge_preds[charge_update_graphs, charge_to_update]
-        if is_in_ring_to_update:
-            init_is_in_ring[is_in_ring_update_graphs, is_in_ring_to_update] = is_in_ring_preds[
-                is_in_ring_update_graphs, is_in_ring_to_update]
-        if is_aromatic_to_update:
-            init_is_aromatic[is_aromatic_update_graphs, is_aromatic_to_update] = is_aromatic_preds[
-                is_aromatic_update_graphs, is_aromatic_to_update]
-        if chirality_to_update:
-            init_chirality[chirality_update_graphs, chirality_to_update] = chirality_preds[
-                chirality_update_graphs, chirality_to_update]
-        if edges_to_update:
-            coords_array = np.array(edges_to_update).transpose()
-            init_edges[edge_update_graphs, coords_array[0], coords_array[1]] = init_edges[
-                edge_update_graphs,
-                coords_array[1], coords_array[0]] = edge_preds[
-                edge_update_graphs, coords_array[0], coords_array[1]]
-        return init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring, init_is_aromatic, init_chirality
+        return node_property_preds, edge_property_preds
 
-    def append_and_convert_graphs(self, init_nodes, init_edges, init_hydrogens, init_charge, init_is_in_ring,
-                                  init_is_aromatic, init_chirality, node_masks, all_final_nodes, all_final_edges,
-                                  all_final_hydrogens, all_final_charge, all_final_is_in_ring, all_final_is_aromatic,
-                                  all_final_chirality, all_final_node_masks, mols, smiles_list):
-        init_nodes, init_edges, init_hydrogens = init_nodes.numpy(), init_edges.numpy(), init_hydrogens.numpy()
-        num_nodes = node_masks.sum(-1)
-        for i in range(len(init_nodes)):
-            all_final_nodes.append(init_nodes[i])
-            all_final_edges.append(init_edges[i])
-            all_final_node_masks.append(node_masks[i])
-            if self.model.embed_hs is True:
-                all_final_hydrogens.append(init_hydrogens[i])
-                all_final_charge.append(init_charge[i])
-                all_final_is_in_ring.append(init_is_in_ring[i])
-                all_final_is_aromatic.append(init_is_aromatic[i])
-                all_final_chirality.append(init_chirality[i])
-            mol = graph_to_mol(init_nodes[i, :int(num_nodes[i])], init_edges[i, :int(num_nodes[i]), :int(num_nodes[i])],
-                               init_charge[i, :int(num_nodes[i])], init_chirality[i, :int(num_nodes[i])],
-                               min_charge=self.min_charge, symbol_list=self.symbol_list)
+    def update_components(self, nodes_to_update, edges_to_update, init_node_properties, init_edge_properties,
+                        node_property_update_graphs, edge_property_update_graphs,
+                        node_property_preds, edge_property_preds):
+        for name in nodes_to_update.keys():
+            if nodes_to_update[name]:
+                init_node_properties[name][node_property_update_graphs[name], nodes_to_update[name]] = \
+                    node_property_preds[name][node_property_update_graphs[name], nodes_to_update[name]]
+        for name in edges_to_update.keys():
+            if edges_to_update:
+                coords_array = np.array(edges_to_update).transpose()
+                init_edge_properties[name][edge_property_update_graphs[name], coords_array[0], coords_array[1]] = \
+                    init_edge_properties[edge_property_update_graphs[name], coords_array[1], coords_array[0]] = \
+                    edge_property_preds[name][edge_property_update_graphs[name], coords_array[0], coords_array[1]]
+        return init_node_properties, init_edge_properties
+
+    def append_and_convert_graphs(self, init_node_properties, init_edge_properties, node_mask,
+                                    all_final_node_properties, all_final_edge_properties, all_final_node_masks,
+                                    mols, smiles_list):
+        num_nodes = node_mask.sum(-1)
+        for i in range(len(init_node_properties['node_type'])):
+            for name, node_property in init_node_properties.items():
+                all_final_node_properties[name].append(node_property[i].numpy())
+            for name, edge_property in init_edge_properties.items():
+                all_final_edge_properties[name].append(edge_property[i].numpy())
+            all_final_node_masks.append(node_mask[i])
+            mol = graph_to_mol({k: v[i][:int(num_nodes[i])] for k, v in init_node_properties.items()},
+                    {k: v[i][:int(num_nodes[i]), :int(num_nodes[i])] for k, v in init_edge_properties.items()},
+                    min_charge=self.train_data.min_charge, symbol_list=self.symbol_list)
             mols.append(mol)
             smiles_list.append(Chem.MolToSmiles(mol))
 
-    def save_checkpoints(self, all_final_nodes, all_final_edges, all_final_hydrogens, all_final_charge,
-                         all_final_is_in_ring, all_final_is_aromatic, all_final_chirality, num_sampling_iters,
+    def save_checkpoints(self, all_final_node_properties, all_final_edge_properties, num_sampling_iters,
                          num_argmax_iters):
         if self.cp_save_dir is not None:
-            to_save = [all_final_nodes, all_final_edges]
-            if self.model.embed_hs is True:
-                to_save.extend([all_final_hydrogens, all_final_charge, all_final_is_in_ring, all_final_is_aromatic,
-                               all_final_chirality])
             save_path = os.path.join(self.cp_save_dir, 'gen_checkpoint_{}_{}.p'.format(
                                      num_sampling_iters, num_argmax_iters))
             with open(save_path, 'wb') as f:
-                pickle.dump(to_save, f)
+                pickle.dump([all_final_node_properties, all_final_edge_properties], f)
 
     def calculate_length_dist(self):
         lengths_dict = {}
-        for mol_nodeind in self.train_data.mol_nodeinds:
-            length = len(mol_nodeind)
+        for node_type in self.train_data.node_properties['node_type']['data']:
+            length = len(node_type)
             if length not in lengths_dict:
                 lengths_dict[length] = 1
             else:
@@ -576,22 +479,8 @@ class GraphGenerator(DistributionMatchingGenerator):
         self.length_dist = lengths_dict
 
     def get_special_inds(self):
-        self.node_empty_index = self.train_data.node_empty_index
-        self.edge_empty_index = self.train_data.edge_empty_index
-        self.node_mask_index = self.train_data.node_mask_index
-        self.edge_mask_index = self.train_data.edge_mask_index
         self.max_nodes = self.train_data.max_nodes
         self.max_edges = int(self.max_nodes * (self.max_nodes-1)/2)
-        if self.train_data.num_hs is not None:
-            self.h_mask_index = self.train_data.h_mask_index
-            self.h_empty_index = self.train_data.h_empty_index
-            self.charge_mask_index = self.train_data.charge_mask_index
-            self.is_in_ring_mask_index = self.train_data.is_in_ring_mask_index
-            self.is_aromatic_mask_index = self.train_data.is_aromatic_mask_index
-            self.chirality_mask_index = self.train_data.chirality_mask_index
-            self.min_charge = self.train_data.min_charge
-        else:
-            self.h_mask_index = self.h_empty_index = 0
 
     def sample_lengths(self, number_samples=1):
         lengths = np.array(list(self.length_dist.keys()))
@@ -599,79 +488,75 @@ class GraphGenerator(DistributionMatchingGenerator):
         samples = np.random.choice(lengths, number_samples, p=probs)
         return samples
 
-    def get_masked_variables(self, lengths, number_samples, num_node_types, num_edge_types, pad=True):
+    def get_masked_variables(self, lengths, number_samples, pad=True):
         if pad is True:
-            init_nodes = np.ones((number_samples, self.max_nodes)) * self.node_empty_index
+            all_init_node_properties, all_init_edge_properties = {}, {}
+            for name, property_info in self.train_data.node_properties.items():
+                all_init_node_properties[name] = np.ones((number_samples, self.max_nodes)) * \
+                                                 property_info['empty_index']
+            for name, property_info in self.train_data.edge_properties.items():
+                all_init_edge_properties[name] = np.ones((number_samples, self.max_nodes, self.max_nodes)) * \
+                                                 property_info['empty_index']
             node_mask = np.zeros((number_samples, self.max_nodes))
-            init_edges = np.ones((number_samples, self.max_nodes, self.max_nodes)) * self.edge_empty_index
             edge_mask = np.zeros((number_samples, self.max_nodes, self.max_nodes))
-            hydrogens = np.ones((number_samples, self.max_nodes)) * self.h_empty_index
-            init_charge = np.ones((number_samples, self.max_nodes)) * abs(self.min_charge)
-            init_is_in_ring = np.zeros((number_samples, self.max_nodes))
-            init_is_aromatic = np.zeros((number_samples, self.max_nodes))
-            init_chirality = np.zeros((number_samples, self.max_nodes))
         else:
-            init_nodes, node_mask, init_edges, edge_mask, hydrogens, init_charge, init_is_in_ring, init_is_aromatic, \
-                        init_chirality = [], [], [], [], [], [], [], [], []
+            all_init_node_properties = {name: [] for name in self.train_data.node_property_names}
+            all_init_edge_properties = {name: [] for name in self.train_data.node_property_names}
+            node_mask, edge_mask = [], []
         for sample_num, length in enumerate(lengths):
             if pad is False:
-                init_nodes.append(np.ones(length) * self.node_empty_index)
+                for name, property_info in self.train_data.node_properties.items():
+                    all_init_node_properties[name].append(np.ones(length) * property_info['empty_index'])
+                for name, property_info in self.train_data.edge_properties.items():
+                    all_init_edge_properties[name].append(np.ones((length, length)) * property_info['empty_index'])
                 node_mask.append(np.zeros(length))
-                init_edges.append(np.ones((length, length)) * self.edge_empty_index)
                 edge_mask.append(np.zeros((length, length)))
-                hydrogens.append(np.ones(length) * self.h_empty_index)
-                init_charge.append(np.ones(length) * abs(self.min_charge))
-                init_is_in_ring.append(np.zeros(length))
-                init_is_aromatic.append(np.zeros(length))
-                init_chirality.append(np.zeros(length))
             if self.random_init:
-                if self.sample_uniformly is True:
-                    node_samples = np.random.randint(0, num_node_types, size=length)
-                    edge_samples = np.random.randint(0, num_edge_types, size=int(length * (length - 1) / 2))
-                    hydrogen_samples = np.random.randint(0, self.h_mask_index, size=length)
-                    charge_samples = np.random.randint(0, self.charge_mask_index, size=length)
-                    is_in_ring_samples = np.random.randint(0, self.is_in_ring_mask_index, size=length)
-                    is_aromatic_samples = np.random.randint(0, self.is_aromatic_mask_index, size=length)
-                    chirality_samples = np.random.randint(0, self.chirality_mask_index, size=length)
-                else:
-                    node_samples = torch.distributions.Categorical(1/self.train_data.node_weights).sample(
-                                                                                                    [length]).numpy()
-                    edge_samples = torch.distributions.Categorical(1/self.train_data.edge_weights).sample(
-                                                                            [int(length * (length - 1) / 2)]).numpy()
-                    hydrogen_samples = torch.distributions.Categorical(1/self.train_data.h_weights).sample(
-                                                                                                    [length]).numpy()
-                    charge_samples = torch.distributions.Categorical(1/self.train_data.charge_weights).sample(
-                                                                                                    [length]).numpy()
-                    is_in_ring_samples = torch.distributions.Categorical(1/self.train_data.is_in_ring_weights).sample(
-                                                                                                    [length]).numpy()
-                    is_aromatic_samples = torch.distributions.Categorical(1/self.train_data.is_aromatic_weights).sample(
-                                                                                                    [length]).numpy()
-                    chirality_samples = torch.distributions.Categorical(1/self.train_data.chirality_weights).sample(
-                                                                                                    [length]).numpy()
-                init_nodes[sample_num][:length] = node_samples
-                rand_edges = deque(edge_samples)
-                for i in range(length):
-                    init_edges[sample_num][i, i] = 0
-                    for j in range(i, length):
-                        if i != j:
-                            init_edges[sample_num][i, j] = init_edges[sample_num][j, i] = rand_edges.pop()
-                hydrogens[sample_num][:length] = hydrogen_samples
-                init_charge[sample_num][:length] = charge_samples
-                init_is_in_ring[sample_num][:length] = is_in_ring_samples
-                init_is_aromatic[sample_num][:length] = is_aromatic_samples
-                init_chirality[sample_num][:length] = chirality_samples
+                for name, property_info in self.train_data.node_properties.items():
+                    if self.sample_uniformly is True:
+                        samples = np.random.randint(0, property_info['num_categories'], size=length)
+                    else:
+                        samples = torch.distributions.Categorical(1/self.train_data.node_property_weights[name]).sample(
+                            [length]).numpy()
+                    all_init_node_properties[name][sample_num][:length] = samples
+
+                for name, property_info in self.train_data.edge_properties.items():
+                    if self.sample_uniformly is True:
+                        samples = np.random.randint(0, property_info['num_categories'],
+                                                    size=int(length * (length - 1) / 2))
+                    else:
+                        samples = torch.distributions.Categorical(1/self.train_data.edge_property_weights[name]).sample(
+                            [int(length * (length - 1) / 2)]).numpy()
+                    rand_edges = deque(samples)
+                    for i in range(length):
+                        all_init_edge_properties[name][sample_num][i, i] = 0
+                        for j in range(i, length):
+                            if i != j:
+                                all_init_edge_properties[name][sample_num][i, j] = \
+                                    all_init_edge_properties[name][sample_num][j, i] = rand_edges.pop()
             else:
-                init_nodes[sample_num][:length] = self.node_mask_index
-                init_edges[sample_num][:length, :length] = self.edge_mask_index
-                hydrogens[sample_num][:length] = self.h_mask_index
-                init_charge[sample_num][:length] = self.charge_mask_index
-                init_is_in_ring[sample_num][:length] = self.is_in_ring_mask_index
-                init_is_aromatic[sample_num][:length] = self.is_aromatic_mask_index
-                init_chirality[sample_num][:length] = self.chirality_mask_index
+                for name, init_node_property in all_init_node_properties.items():
+                    init_node_property[sample_num][:length] = self.train_data.node_properties[name]['mask_index']
+                for name, init_edge_property in all_init_edge_properties.items():
+                    init_edge_property[sample_num][:length, :length] = \
+                        self.train_data.edge_properties[name]['mask_index']
+
             node_mask[sample_num][:length] = 1
             edge_mask[sample_num][:length, :length] = 1
-        return init_nodes, init_edges, node_mask, edge_mask, hydrogens, init_charge, init_is_in_ring,\
-               init_is_aromatic, init_chirality
+        return all_init_node_properties, all_init_edge_properties, node_mask, edge_mask
+
+    def evaluate_cond_generation(self, smiles_list, json_output_path):
+        valid_mols = []
+        for s in smiles_list:
+            mol = Chem.MolFromSmiles(s)
+            if mol is not None: valid_mols.append(mol)
+
+        graph_properties = calculate_graph_properties(valid_mols, self.cond_property_values.keys())
+        graph_property_stats = {name: {'mean': np.mean(graph_property), 'median': np.median(graph_property),
+                                       'std': np.std(graph_property)}
+                                for name, graph_property in graph_properties.items()}
+        with open(json_output_path, 'w') as f:
+            json.dump(graph_property_stats, f)
 
 def get_load_path(num_sampling_iters, num_argmax_iters, cp_save_dir):
     all_cp_iters = {}

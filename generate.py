@@ -3,7 +3,7 @@ import torch
 
 from src.data.loader import load_graph_data
 from src.model.gnn import MODELS_DICT
-from src.model.graph_generator import GraphGenerator, MockGenerator, MockGDGenerator, \
+from src.model.graph_generator import GraphGenerator, MockGenerator, \
     evaluate_uncond_generation
 from train_script_parser import get_parser
 
@@ -52,6 +52,9 @@ def get_final_parser():
     parser.add_argument('--use_mock_generator', action='store_true')
     parser.add_argument('--smiles_load_path', default=None, help='Path to smiles strings that have already been'
                                                                  'generated, for use with mock generator')
+    # arguments used for conditional generation
+    parser.add_argument('--cond_property_values', type=json.loads, default='{}', help='dictionary with ' \
+                        'graph property name as key and target value of property as value')
 
     return parser
 
@@ -64,12 +67,9 @@ def setup_data_and_generator(params):
     if not os.path.isdir(output_dir):
         os.makedirs(output_dir)
     if params.use_mock_generator is True:
-        if params.goal_directed is True:
-            generator = MockGDGenerator(params.smiles_load_path)
-        else:
-            with open(params.smiles_load_path) as f:
-                smiles_list = f.read().strip().split('\n')
-            generator = MockGenerator(smiles_list, params.num_samples_to_generate)
+        with open(params.smiles_load_path) as f:
+            smiles_list = f.read().strip().split('\n')
+        generator = MockGenerator(smiles_list, params.num_samples_to_generate)
         if params.evaluate_connected_only is True:
            generator.smiles_list = [s for s in generator.smiles_list if '.' not in s]
     else:
@@ -94,7 +94,7 @@ def setup_data_and_generator(params):
                                    params.checkpointing_period, params.save_period, params.evaluation_period,
                                    params.evaluate_finegrained, params.save_finegrained,
                                    params.variables_per_gibbs_iteration, params.top_k,
-                                   params.save_init)
+                                   params.save_init, params.cond_property_values)
 
     return generator
 
