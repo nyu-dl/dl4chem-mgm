@@ -1,7 +1,8 @@
 # Masked Graph Modeling for Molecule Generation
 
 This repository and its references contain the models, data and scripts used to carry out the experiments in the
-Masked Graph Modeling for Molecule Generation paper.
+[Masked Graph Modeling for Molecule Generation](https://chemrxiv.org/articles/preprint/Masked_Graph_Modeling_for_Molecule_Generation/13143167)
+paper.
 
 ## Dependencies
 ### Python
@@ -132,3 +133,7 @@ MGM generation script used above.
 
 To print generation results at each step in a dataframe:
 `python get_best_distributional_results.py <output_dir>`
+
+## Citation
+If you've found the resources in this repository useful, please consider citing:
+@misc{mahmood-mgm, title={Masked Graph Modeling for Molecule Generation}, author={Mahmood, Omar and Mansimov, Elman and Bonneau, Richard and Cho, Kyunghyun}, year={2020}} 
