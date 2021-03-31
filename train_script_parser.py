@@ -23,6 +23,11 @@ def get_parser():
                         help="Data path for QM9, train data path for ChEMBL")
     parser.add_argument("--val_graph_properties_path", type=str, default="data/ChEMBL/ChEMBL_val_graph_properties.p",
                         help="Validation data path for ChEMBL")
+    parser.add_argument('--graph2binary_properties_path', type=str, default='data/proteins/pdb_golabels.p')
+    parser.add_argument('--val_graph2binary_properties_path', type=str, default=None)
+    parser.add_argument('--pretrained_property_embeddings_path', type=str,
+                        default='data/proteins/preprocessed_go_embeddings.npy', help='path to pretrained embeddings '
+                                'for binary graph properties such as GO terms')
     parser.add_argument("--seed", type=int, default=0,
                         help="random seed")
     parser.add_argument('--val_seed', type=int, default=None)
@@ -35,14 +40,16 @@ def get_parser():
                                                                   'checkpoint')
 
     # model and data parameters
-    parser.add_argument('--model_name', choices=['GraphNN', 'GraphVAE', 'CGVAE'], default='GraphNN')
-    parser.add_argument("--dim_h", type=int, default=2048,
-                        help="Hidden dimension size")
-    parser.add_argument("--dim_k", type=int, default= 1,
-                        help="Max rank of edge matrices")
+    parser.add_argument('--model_name', choices=['GraphNN', 'SeqGraphNN'], default='GraphNN')
+    parser.add_argument("--dim_h", type=int, default=2048, help="Hidden dimension size")
+    parser.add_argument("--dim_k", type=int, default= 1, help="Max rank of edge matrices")
+    parser.add_argument("--seq_output_dim", type=int, default=768,
+                        help="dimensionality of sequence model output in SeqGraphNN")
     parser.add_argument('--use_newest_edges', action='store_true', help='In MPNN, use most edges from layer l+1 instead'
                                                                         'of l to update nodes in layer l')
-    parser.add_argument("--graph_type", choices=['QM9', 'ChEMBL'], default='QM9')
+    parser.add_argument("--graph_type", choices=['QM9', 'ChEMBL', 'protein'], default='QM9')
+    parser.add_argument("--ar", action='store_true', help='Use autoregressive model (transformer) instead of graph neural network')
+    parser.add_argument("--use_smiles", action='store_true', help='Use smiles representation of the molecules')
     parser.add_argument("--num_node_types", type=int, default=None)
     parser.add_argument("--num_edge_types", type=int, default=None, help='includes no edge as a type of edge')
     parser.add_argument('--no_edge_present_type', choices=['learned', 'zeros'], default='zeros', help='whether'
@@ -74,12 +81,13 @@ def get_parser():
     parser.add_argument('--graph_property_names', type=str, nargs='+', default=[])
     parser.add_argument('--normalise_graph_properties', action='store_true')
     parser.add_argument('--predict_graph_properties', action='store_true')
+    parser.add_argument('--num_binary_graph_properties', type=int, default=0)
 
     # MPNN parameters
     parser.add_argument('--mpnn_name', choices=['EdgesOwnRepsMPNN', 'EdgesFromNodesMPNN'],
                         default='EdgesFromNodesMPNN', help='name of mpnn to use')
     parser.add_argument('--fully_connected', action='store_true', help='use fully connected graph in mpnns')
-    parser.add_argument('--node_mpnn_name', choices=['MultiplicationMPNN', 'AdditionMPNN', 'TestMPNN', 'MAT',
+    parser.add_argument('--node_mpnn_name', choices=['MultiplicationMPNN', 'AdditionMPNN', 'TestMPNN',
                                     'NbrMultMPNN', 'NbrEWMultMPNN', 'DummyNodeMPNN'],
                                     default='NbrEWMultMPNN', help='name of node mpnn to use in mpnn')
     parser.add_argument('--update_edges_at_end_only', action='store_true', help='update edge representations in the'
@@ -92,8 +100,6 @@ def get_parser():
     parser.add_argument('--global_connection', action='store_true', help='include global connection from all nodes in'
                                                                             'graph during message passing stage')
     parser.add_argument("--num_mpnns", type=int, default=1)
-    parser.add_argument("--num_encoder_mpnns", type=int, default=1, help='Number of CVAE encoder mpnns')
-    parser.add_argument("--num_decoder_mpnns", type=int, default=1, help='Number of CVAE decoder mpnns')
     parser.add_argument("--mpnn_steps", type=int, default=4)
     parser.add_argument("--layer_norm", action='store_true')
     parser.add_argument("--res_conn", action='store_true')
@@ -129,12 +135,6 @@ def get_parser():
                                                                           'graph')
     parser.add_argument("--force_replace_predict", action='store_true', help='predict at least one replaced component '
                                                                              'per graph')
-
-    # MAT parameters
-    parser.add_argument('--mat_N', type=int, default=2, help='number of dense layers in positionwise feedforward')
-    parser.add_argument('--mat_d_model', type=int, default=64, help='model dimensionality')
-    parser.add_argument('--mat_h', type=int, default=8, help='number of attention heads')
-    parser.add_argument('--mat_dropout', type=float, default=0.1, help='dropout probability')
 
     # optimizer parameters
     parser.add_argument("--optimizer", type=str, default="adam,beta1=0.9,beta2=0.98,lr=0.0001",
@@ -180,8 +180,6 @@ def get_parser():
     parser.add_argument('--suppress_train_log', action='store_true', help='Do not log train results')
     parser.add_argument('--suppress_params', action='store_true', help='Do not log argparse params')
     parser.add_argument('--check_pred_validity', action='store_true', help='check if predicted molecules are valid')
-    parser.add_argument('--run_perturbation_analysis', action='store_true', help='run perturbation analysis during'
-                                                                                 'validation')
     parser.add_argument('--log_train_steps', default=200, help='train steps to log')
     parser.add_argument('--val_after', default=1000, type=int, help='validate after how many steps')
     parser.add_argument('--val_dataset_size', default=-1, type=int, help='number of validation datapoints, use all '

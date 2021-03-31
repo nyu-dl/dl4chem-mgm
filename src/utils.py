@@ -12,6 +12,8 @@ import os
 import random
 import re
 import time
+from collections import OrderedDict
+import copy
 
 import numpy as np
 import torch
@@ -29,6 +31,67 @@ TRUTHY_STRINGS = {'on', 'true', '1'}
 DUMP_PATH = '/checkpoint/%s/dumped' % getpass.getuser()
 DYNAMIC_COEFF = ['lambda_clm', 'lambda_mlm', 'lambda_pc', 'lambda_ae', 'lambda_mt', 'lambda_bt']
 
+DEEPFRI_VOCAB = OrderedDict([
+    ('-', 0),
+    ('D', 1),
+    ('G', 2),
+    ('U', 3),
+    ('L', 4),
+    ('N', 5),
+    ('T', 6),
+    ('K', 7),
+    ('H', 8),
+    ('Y', 9),
+    ('W', 10),
+    ('C', 11),
+    ('P', 12),
+    ('V', 13),
+    ('S', 14),
+    ('O', 15),
+    ('I', 16),
+    ('E', 17),
+    ('F', 18),
+    ('X', 19),
+    ('Q', 20),
+    ('A', 21),
+    ('B', 22),
+    ('Z', 23),
+    ('R', 24),
+    ('M', 25),
+    ('<mask>', 26)])
+DEEPFRI_VOCAB_KEYS = list(DEEPFRI_VOCAB.keys())
+
+IUPAC_VOCAB = OrderedDict([
+    ("<pad>", 0),
+    ("<mask>", 1),
+    ("<cls>", 2),
+    ("<sep>", 3),
+    ("<unk>", 4),
+    ("A", 5),
+    ("B", 6),
+    ("C", 7),
+    ("D", 8),
+    ("E", 9),
+    ("F", 10),
+    ("G", 11),
+    ("H", 12),
+    ("I", 13),
+    ("K", 14),
+    ("L", 15),
+    ("M", 16),
+    ("N", 17),
+    ("O", 18),
+    ("P", 19),
+    ("Q", 20),
+    ("R", 21),
+    ("S", 22),
+    ("T", 23),
+    ("U", 24),
+    ("V", 25),
+    ("W", 26),
+    ("X", 27),
+    ("Y", 28),
+    ("Z", 29)])
 
 class AttrDict(dict):
     def __init__(self, *args, **kwargs):
@@ -424,8 +487,12 @@ def calculate_graph_properties(mols, property_names):
         graph_properties[name] = [graph_property_mapper[name](m) for m in mols]
     return graph_properties
 
-def dct_to_cuda(dct):
-    return {key: value.cuda() for key, value in dct.items()}
+def dct_to_cuda_inplace(dct):
+    for key in dct.keys():
+        dct[key] = dct[key].cuda()
 
-def dct_to_cpu(dct):
-    return {key: value.cpu() for key, value in dct.items()}
+def copy_graph_remove_data(input_graph):
+    output_graph = copy.deepcopy(input_graph)
+    for key in input_graph.ndata.keys(): del output_graph.ndata[key]
+    for key in input_graph.edata.keys(): del output_graph.edata[key]
+    return output_graph

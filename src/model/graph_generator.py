@@ -11,9 +11,9 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 from data.gen_targets import get_symbol_list
-from src.data.loader import SizeSampler
+from src.data.loader import SizeSampler, graph_collate_fn
 from src.utils import set_seed_if, graph_to_mol, get_index_method, filter_top_k, calculate_graph_properties,\
-    dct_to_cuda, dct_to_cpu
+    dct_to_cuda_inplace, copy_graph_remove_data
 
 if int(tf.__version__.split('.')[0]) <= 1:
     config = tf.ConfigProto()
@@ -84,8 +84,7 @@ class GraphGenerator(DistributionMatchingGenerator):
         self.variables_per_gibbs_iteration = variables_per_gibbs_iteration
         self.top_k = top_k
         self.save_init = save_init
-        self.model_forward = self.model_forward_cgvae if self.model.__class__.__name__ == 'CGVAE' \
-                                                      else self.model_forward_mgm
+        self.model_forward = self.model_forward_mgm
 
         if self.one_property_per_loop is True:
             self.node_property_ints = {'node_type': 1, 'hydrogens': 2, 'charge': 3, 'is_in_ring': 4, 'is_aromatic': 5,
@@ -188,34 +187,21 @@ class GraphGenerator(DistributionMatchingGenerator):
         all_final_edge_properties = {name: [] for name in self.train_data.edge_property_names}
         all_final_node_masks = []
         print('Generator length: {}'.format(len(loader)), flush=True)
-        for init_node_properties, orig_node_properties, node_property_target_types, node_mask, \
-            init_edge_properties, orig_edge_properties, edge_property_target_types, edge_mask, \
-            graph_properties in tqdm(loader):
+        for batch_init_graph, _, batch_target_type_graph, batch_target_type_transpose_graph, \
+            graph_properties, binary_graph_properties in tqdm(loader):
             if self.local_cpu is False:
-                init_node_properties = dct_to_cuda(init_node_properties)
-                node_mask = node_mask.cuda()
-                init_edge_properties = dct_to_cuda(init_edge_properties)
-                edge_mask = edge_mask.cuda()
-                graph_properties = dct_to_cuda(graph_properties)
+                batch_init_graph = batch_init_graph.to(torch.device('cuda'))
+                dct_to_cuda_inplace(graph_properties)
+                if binary_graph_properties: binary_graph_properties = binary_graph_properties.cuda()
 
-            if self.generation_algorithm == 'gibbs':
-                init_node_properties, init_edge_properties = self.carry_out_gibbs_sampling_sweeps(init_node_properties,
-                                                                init_edge_properties, node_mask, edge_mask,
-                                                                graph_properties, use_argmax)
-            elif self.generation_algorithm == 'simultaneous':
-                init_node_properties, init_edge_properties = self.sample_simultaneously(init_node_properties,
-                                                    init_edge_properties, node_mask, edge_mask,
-                                                    node_property_target_types, edge_property_target_types,
-                                                    graph_properties, use_argmax)
+            batch_init_graph = self.sample_simultaneously(batch_init_graph,
+                                                batch_target_type_graph, batch_target_type_transpose_graph,
+                                                graph_properties, binary_graph_properties, use_argmax)
 
-            init_node_properties = dct_to_cpu(init_node_properties)
-            init_edge_properties = dct_to_cpu(init_edge_properties)
-            node_mask = node_mask.cpu()
-            del edge_mask
+            batch_init_graph = batch_init_graph.to(torch.device('cpu'))
 
-            self.append_and_convert_graphs(init_node_properties, init_edge_properties, node_mask,
-                                           all_final_node_properties, all_final_edge_properties, all_final_node_masks,
-                                           mols, smiles_list)
+            self.append_and_convert_graphs(batch_init_graph, all_final_node_properties, all_final_edge_properties,
+                                           all_final_node_masks, mols, smiles_list)
         
         return all_final_node_properties, all_final_edge_properties, all_final_node_masks, smiles_list
 
@@ -231,7 +217,7 @@ class GraphGenerator(DistributionMatchingGenerator):
         else:
             lengths = self.sample_lengths(number_samples)
             all_init_node_properties, all_init_edge_properties, all_node_masks, all_edge_masks = \
-                self.get_masked_variables(lengths, number_samples, self.edges_per_batch <= 0)
+                self.get_masked_variables(lengths, number_samples, pad=False)
         return all_init_node_properties, all_init_edge_properties, all_node_masks, all_edge_masks
 
     def get_dataloader(self, all_init_node_properties, all_node_masks, all_init_edge_properties, number_samples,
@@ -258,202 +244,79 @@ class GraphGenerator(DistributionMatchingGenerator):
         if self.edges_per_batch > 0:
             batch_sampler = SizeSampler(gen_dataset, self.edges_per_batch)
             batch_sampler.batches.reverse()
-            loader = DataLoader(gen_dataset, batch_sampler=batch_sampler)
+            loader = DataLoader(gen_dataset, batch_sampler=batch_sampler, collate_fn=graph_collate_fn)
         else:
-            loader = DataLoader(gen_dataset, batch_size=self.batch_size)
+            loader = DataLoader(gen_dataset, batch_size=self.batch_size, collate_fn=graph_collate_fn)
         return loader
 
-    def carry_out_gibbs_sampling_sweeps(self, init_node_properties, init_edge_properties, node_mask, edge_mask,
-                                        graph_properties, use_argmax):
-        if self.edges_per_batch > 0:
-            max_nodes = len(init_node_properties['node_type'][0])
-            max_edges = int(max_nodes * (max_nodes - 1) / 2)
-        else:
-            max_nodes, max_edges = self.max_nodes, self.max_edges
-        num_nodes = node_mask.sum(-1)
-        unique_edge_coords, num_unique_edges, generation_arrays, node_property_arrays, edge_property_arrays = \
-            self.get_unshuffled_update_order_arrays(len(init_node_properties['node_type']), num_nodes)
-
-        max_num_components = max_nodes + max_edges
-        if self.one_property_per_loop is True:
-            max_num_components = len(self.node_property_ints.keys()) * max_nodes + \
-                                 len(self.edge_property_ints.keys()) * max_edges
-        generation_queue = deque(get_shuffled_array(generation_arrays, max_num_components).transpose())
-        node_property_queues = {name: self.get_shuffled_queues(arrays, max_nodes) \
-                                for name, arrays in node_property_arrays.items()}
-        edge_property_queues = {name: self.get_shuffled_queues(arrays, max_edges) \
-                                for name, arrays in edge_property_arrays.items()}
+    def sample_simultaneously(self, batch_init_graph, batch_target_type_graph, batch_target_type_transpose_graph,
+                              graph_properties=None, binary_graph_properties=None, use_argmax=False):
+        batch_preds_graph = copy_graph_remove_data(batch_init_graph)
         with torch.no_grad():
-            while len(generation_queue) > 0:
-                next_target_types = [generation_queue.popleft() \
-                                     for _ in range(min(len(generation_queue), self.variables_per_gibbs_iteration))]
-                next_target_types = np.vstack(next_target_types)
+            _, batch_scores_graph, graph_property_scores = self.model_forward(batch_init_graph, graph_properties,
+                                                                 binary_graph_properties)
+        # This breaks symmetry for edge data
+        batch_preds_graph = self.predict_from_scores(batch_scores_graph, batch_preds_graph, use_argmax)
 
-                node_property_update_graphs = {name: np.where(next_target_types == property_int)[1] \
-                                               for name, property_int in self.node_property_ints.items()}
-                edge_property_update_graphs = {name: np.where(next_target_types == property_int)[1] \
-                                               for name, property_int in self.edge_property_ints.items()}
+        for name, target_type in batch_target_type_graph.ndata.items():
+            batch_init_graph.ndata[name][target_type.numpy() != 0] = \
+                batch_preds_graph.ndata[name][target_type.numpy() != 0]
 
-                # replace nodes, node properties and edges
-                nodes_to_update = {name: node_property_queues[name][ind].popleft() \
-                                        for name, property_update_graphs in node_property_update_graphs.items() \
-                                        for ind in property_update_graphs}
-                edges_to_update = {name: edge_property_queues[name][ind].popleft() \
-                                   for name, property_update_graphs in edge_property_update_graphs.items() \
-                                   for ind in property_update_graphs}
+        for name, target_type in batch_target_type_graph.edata.items():
+            batch_init_graph.edata[name][target_type.numpy() != 0] = \
+                batch_preds_graph.edata[name][target_type.numpy() != 0]
+            batch_init_graph.edata[name][batch_target_type_transpose_graph.edata[name].numpy() != 0] = \
+                batch_preds_graph.edata[name][batch_target_type_transpose_graph.edata[name].numpy() != 0]
 
-                if self.mask_comp_to_predict is True:
-                    self.mask_one_entry_per_graph(init_node_properties, init_edge_properties,
-                                                  node_property_update_graphs, edge_property_update_graphs,
-                                                  nodes_to_update, edges_to_update, node_mask, edge_mask)
+        return batch_init_graph
 
-                node_property_scores, edge_property_scores, graph_property_scores = self.model_forward(
-                    init_node_properties, init_edge_properties, node_mask, edge_mask, graph_properties)
+    def model_forward_mgm(self, batch_init_graph, graph_properties=None, binary_graph_properties=None):
+        return self.model(batch_init_graph, graph_properties, binary_graph_properties)
 
-                node_property_preds, edge_property_preds = self.predict_from_scores(node_property_scores,
-                                                                                    edge_property_scores, use_argmax)
-
-                init_node_properties, init_edge_properties = self.update_components(
-                        nodes_to_update, edges_to_update, init_node_properties, init_edge_properties,
-                        node_property_update_graphs, edge_property_update_graphs,
-                        node_property_preds, edge_property_preds)
-
-        return init_node_properties, init_edge_properties
-
-    def sample_simultaneously(self, init_node_properties, init_edge_properties, node_mask, edge_mask,
-                                node_property_target_types, edge_property_target_types, graph_properties=None,
-                                use_argmax=False):
-        with torch.no_grad():
-            node_property_scores, edge_property_scores, graph_property_scores = self.model_forward(
-                init_node_properties, init_edge_properties, node_mask, edge_mask, graph_properties)
-        node_property_preds, edge_property_preds = self.predict_from_scores(node_property_scores, edge_property_scores,
-                                                                            use_argmax)
-
-        for name, node_property in init_node_properties.items():
-            targets = node_property_target_types[name] != 0
-            node_property[targets] = node_property_preds[name][targets]
-
-        for name, edge_property in init_edge_properties.items():
-            target_coords = np.where(edge_property_target_types[name] != 0)
-            edge_property[target_coords] = edge_property_preds[name][target_coords]
-            edge_property[target_coords[0], target_coords[2], target_coords[1]] = \
-                edge_property_preds[name][target_coords]
-
-        return init_node_properties, init_edge_properties
-
-    def get_unshuffled_update_order_arrays(self, batch_size, num_nodes):
-        unique_edge_coords, num_unique_edges, generation_arrays = [], [], []
-        node_property_arrays = {name: [] for name in self.node_property_ints.keys()}
-        edge_property_arrays = {name: [] for name in self.edge_property_ints.keys()}
-        for i in range(batch_size):
-            unique_edge_coords.append(list(zip(*np.triu_indices(num_nodes[i], k=1))))
-            num_unique_edges.append(len(unique_edge_coords[i]))
-            generation_array = []
-            for name, npi in self.node_property_ints.items():
-                if self.one_property_per_loop is True: # or self.mask_independently is True ?
-                    generation_array.extend([npi] * int(num_nodes[i]))
-                else:
-                    generation_array.extend([self.node_property_ints['node_type']] * int(num_nodes[i]))
-                node_property_arrays[name].append(np.arange(int(num_nodes[i])))
-            for name, epi in self.edge_property_ints.items():
-                generation_array.extend([epi] * int(num_unique_edges[i]))
-                edge_property_arrays[name].append(unique_edge_coords[i])
+    def predict_from_scores(self, batch_scores_graph, batch_preds_graph, use_argmax=False):
+        for property_name, scores in batch_scores_graph.ndata.items():
+            if use_argmax is True:
+                batch_preds_graph.ndata[property_name] = torch.argmax(F.softmax(scores, -1), dim=-1)
             else:
-                generation_array = np.array([self.node_property_ints['node_type']] * int(num_nodes[i]) +
-                                            [self.edge_property_ints['edge_type']] * int(num_unique_edges[i]))
-            generation_arrays.append(generation_array)
-        return unique_edge_coords, num_unique_edges, generation_arrays, node_property_arrays, edge_property_arrays
-
-    def get_shuffled_queues(self, array_to_shuffle, max_num_components):
-        shuffled_array = get_shuffled_array(array_to_shuffle, max_num_components)
-        queues = [deque(array) for array in shuffled_array]
-        return queues
-
-    def mask_one_entry_per_graph(self, init_node_properties, init_edge_properties,
-                                 node_property_update_graphs, edge_property_update_graphs,
-                                 nodes_to_update, edges_to_update, node_mask, edge_mask):
-        for name in nodes_to_update.keys():
-            if nodes_to_update[name]:
-                init_node_properties[name][node_property_update_graphs[name], nodes_to_update[name]] = \
-                    self.train_data.node_properties[name]['mask_index']
-                if self.no_edge_present_type == 'zeros':
-                    node_mask[node_property_update_graphs[name], nodes_to_update[name]] = 1
-        for name in edges_to_update.keys():
-            if edges_to_update[name]:
-                coords_array = np.array(edges_to_update[name]).transpose()
-                init_edge_properties[edge_property_update_graphs[name], coords_array[0], coords_array[1]] = \
-                    init_edge_properties[edge_property_update_graphs[name], coords_array[1], coords_array[0]] = \
-                    self.train_data.edge_properties['edge_type']['mask_index']
-                if self.no_edge_present_type == 'zeros':
-                    edge_mask[edge_property_update_graphs[name], coords_array[0], coords_array[1]] = \
-                        edge_mask[edge_property_update_graphs[name], coords_array[1], coords_array[0]] = 1
-
-    def model_forward_mgm(self, init_node_properties, init_edge_properties, node_mask, edge_mask,
-                          graph_properties=None):
-        return self.model(init_node_properties, node_mask, init_edge_properties, edge_mask, graph_properties)
-
-    def model_forward_cgvae(self, init_nodes, init_edges, node_masks, edge_masks, init_hydrogens):
-        node_target_inds_vector = getattr(init_nodes == self.node_mask_index, self.index_method)()
-        edge_target_coords_matrix = getattr(init_edges == self.edge_mask_index, self.index_method)()
-        node_scores, edge_scores, hydrogen_scores, _, _, _, _ = self.model.prior_forward(
-            init_nodes, init_edges, node_masks, edge_masks, init_hydrogens,
-            node_target_inds_vector, edge_target_coords_matrix
-        )
-        return node_scores, edge_scores, hydrogen_scores
-
-    def drop_minority_loc_majority_scores(self, init_nodes, node_scores, majority_node_index=1):
-        minority_node_locs = np.where(init_nodes != majority_node_index)
-        node_scores[list(minority_node_locs) +
-                    [np.ones_like(minority_node_locs[0]) * majority_node_index]] = -9999
-
-    def predict_from_scores(self, node_property_scores, edge_property_scores, use_argmax=False):
-        if use_argmax is True:
-            node_property_preds = {name: torch.argmax(F.softmax(scores, -1), dim=-1) \
-                                   for name, scores in node_property_scores.items()}
-            edge_property_preds = {name: torch.argmax(F.softmax(scores, -1), dim=-1) \
-                                   for name, scores in edge_property_scores.items()}
-        else:
-            node_property_preds, edge_property_preds = {}, {}
-            for name, scores in node_property_scores.items():
                 if self.top_k > 0:
                     scores = filter_top_k(scores, self.top_k)
-                node_property_preds[name] = torch.distributions.Categorical(F.softmax(scores, -1)).sample()
-
-            for name, scores in edge_property_scores.items():
+                batch_preds_graph.ndata[property_name] = torch.distributions.Categorical(F.softmax(scores, -1)).sample()
+        for property_name, scores in batch_scores_graph.edata.items():
+            if use_argmax is True:
+                batch_preds_graph.edata[property_name] = torch.argmax(F.softmax(scores, -1), dim=-1)
+            else:
                 if self.top_k > 0:
                     scores = filter_top_k(scores, self.top_k)
-                edge_property_preds[name] = torch.distributions.Categorical(F.softmax(scores, -1)).sample()
+                batch_preds_graph.edata[property_name] = torch.distributions.Categorical(F.softmax(scores, -1)).sample()
 
-        return node_property_preds, edge_property_preds
+        return batch_preds_graph
 
-    def update_components(self, nodes_to_update, edges_to_update, init_node_properties, init_edge_properties,
-                        node_property_update_graphs, edge_property_update_graphs,
-                        node_property_preds, edge_property_preds):
-        for name in nodes_to_update.keys():
-            if nodes_to_update[name]:
-                init_node_properties[name][node_property_update_graphs[name], nodes_to_update[name]] = \
-                    node_property_preds[name][node_property_update_graphs[name], nodes_to_update[name]]
-        for name in edges_to_update.keys():
-            if edges_to_update:
-                coords_array = np.array(edges_to_update).transpose()
-                init_edge_properties[name][edge_property_update_graphs[name], coords_array[0], coords_array[1]] = \
-                    init_edge_properties[edge_property_update_graphs[name], coords_array[1], coords_array[0]] = \
-                    edge_property_preds[name][edge_property_update_graphs[name], coords_array[0], coords_array[1]]
-        return init_node_properties, init_edge_properties
-
-    def append_and_convert_graphs(self, init_node_properties, init_edge_properties, node_mask,
+    def append_and_convert_graphs(self, batch_init_graph,
                                     all_final_node_properties, all_final_edge_properties, all_final_node_masks,
                                     mols, smiles_list):
-        num_nodes = node_mask.sum(-1)
-        for i in range(len(init_node_properties['node_type'])):
-            for name, node_property in init_node_properties.items():
-                all_final_node_properties[name].append(node_property[i].numpy())
-            for name, edge_property in init_edge_properties.items():
-                all_final_edge_properties[name].append(edge_property[i].numpy())
-            all_final_node_masks.append(node_mask[i])
-            mol = graph_to_mol({k: v[i][:int(num_nodes[i])] for k, v in init_node_properties.items()},
-                    {k: v[i][:int(num_nodes[i]), :int(num_nodes[i])] for k, v in init_edge_properties.items()},
-                    min_charge=self.train_data.min_charge, symbol_list=self.symbol_list)
+        all_final_len = len(all_final_node_properties[list(all_final_node_properties.keys())[0]])
+        node_start, edge_start = 0, 0
+        for i, num_nodes in enumerate(batch_init_graph.batch_num_nodes):
+            num_edges = batch_init_graph.batch_num_edges[i]
+            for name, property in batch_init_graph.ndata.items():
+                all_final_node_properties[name].append(property[node_start:node_start+num_nodes].numpy())
+            all_final_node_masks.append(np.ones(num_nodes)) # redundant but needs to remain until node masks removed
+                                                            # from generation
+            for name, property in batch_init_graph.edata.items():
+                single_datapoint_fc_data = np.zeros((num_nodes, num_nodes))
+                single_datapoint_fc_data[
+                    batch_init_graph.edges()[0][edge_start:edge_start+num_edges].numpy() - node_start,
+                    batch_init_graph.edges()[1][edge_start:edge_start+num_edges].numpy() - node_start] = \
+                    property[edge_start:edge_start+num_edges].numpy()
+                # force symmetry, which is broken earlier by sampling edge predictions
+                single_datapoint_fc_data = np.triu(single_datapoint_fc_data) + np.tril(single_datapoint_fc_data.T, -1)
+                all_final_edge_properties[name].append(single_datapoint_fc_data)
+            node_start += num_nodes
+            edge_start += num_edges
+
+            mol = graph_to_mol({k: v[all_final_len+i] for k, v in all_final_node_properties.items()},
+                               {k: v[all_final_len+i] for k, v in all_final_edge_properties.items()},
+                               min_charge=self.train_data.min_charge, symbol_list=self.symbol_list)
             mols.append(mol)
             smiles_list.append(Chem.MolToSmiles(mol))
 
@@ -501,7 +364,7 @@ class GraphGenerator(DistributionMatchingGenerator):
             edge_mask = np.zeros((number_samples, self.max_nodes, self.max_nodes))
         else:
             all_init_node_properties = {name: [] for name in self.train_data.node_property_names}
-            all_init_edge_properties = {name: [] for name in self.train_data.node_property_names}
+            all_init_edge_properties = {name: [] for name in self.train_data.edge_property_names}
             node_mask, edge_mask = [], []
         for sample_num, length in enumerate(lengths):
             if pad is False:

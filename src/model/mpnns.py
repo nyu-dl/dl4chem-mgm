@@ -5,7 +5,6 @@ import numpy as np
 import torch
 from torch import nn
 
-from src.model.mat import make_model
 from src.model.node_mpnns import NODE_MPNN_DICT
 
 
@@ -17,15 +16,7 @@ class MPNN(nn.Module):
         self.mpnn_steps = mpnn_steps
         self.res_conn = res_conn
         self.node_mpnn_name = node_mpnn_name
-        if self.node_mpnn_name == 'MAT':
-            self.node_mpnn = make_model(d_atom=dim_h, N=kwargs['mat_N'], d_model=kwargs['mat_d_model'],
-                    h=kwargs['mat_h'], dropout=kwargs['mat_dropout'], lambda_attention=0.5, lambda_distance=0.0,
-                    trainable_lambda=False, N_dense=2, leaky_relu_slope=0.0, aggregation_type='skip',
-                    dense_output_nonlinearity='relu', distance_matrix_kernel='exp', use_edge_features=True,
-                    n_output=dim_h, control_edges=False, integrated_distances=False, scale_norm=False,
-                    init_type='normal', use_adapter=False, n_generator_layers=1)
-        else:
-            self.node_mpnn = NODE_MPNN_DICT[node_mpnn_name](dim_h, use_layer_norm, spatial_msg_res_conn,
+        self.node_mpnn = NODE_MPNN_DICT[node_mpnn_name](dim_h, use_layer_norm, spatial_msg_res_conn,
                                                             spatial_postgru_res_conn, global_connection)
         self.use_newest_edges = use_newest_edges
         self.update_edges_at_end_only = update_edges_at_end_only
@@ -58,15 +49,17 @@ class MPNN(nn.Module):
         graphs = dgl.batch(graphs)
         return graphs
 
-    def forward(self, edges, nodes, node_mask, edge_mask, adj_mat_inds):
-        graphs = self.batch_graph_from_data(nodes, node_mask, adj_mat_inds)
-        new_nodes, new_edges = nodes, edges
+    def forward(self, batch_graph):
+        if self.res_conn is True:
+            old_nodes, old_edges = batch_graph.ndata['nodes'], batch_graph.edata['edge_spans']
         for step_num in range(self.mpnn_steps):
-            new_nodes, new_edges = self.mpnn_step_forward(graphs, new_nodes, new_edges, node_mask, edge_mask,
-                                                          adj_mat_inds, step_num)
+            updated_nodes, updated_edges = self.mpnn_step_forward(batch_graph, step_num)
             if self.res_conn is True:
-                new_nodes, new_edges = nodes + new_nodes, edges + new_edges
-        return new_nodes, new_edges
+                updated_nodes = updated_nodes + old_nodes
+                updated_edges = updated_edges + old_edges
+            batch_graph.ndata['nodes'] = updated_nodes
+            batch_graph.edata['edge_spans'] = updated_edges
+        return batch_graph
 
     def update_nodes(self, graphs, nodes, node_mask, adj_mat_inds, edges):
         if self.node_mpnn_name == 'MAT':
@@ -75,28 +68,15 @@ class MPNN(nn.Module):
         else:
             return self.node_mpnn(graphs, node_mask)
 
-    def mpnn_step_forward_nonfc(self, graphs, nodes, edges, node_mask, edge_mask, adj_mat_inds, step_num):
-
-        # calculate new node representations
-        graphs.ndata['nodes'] = nodes[node_mask.bool()]
-        edge_locations = np.where(adj_mat_inds.cpu())
-        graphs.edata['edge_spans'] = edges[edge_locations]
-        new_edges = edges
-
+    def mpnn_step_forward_nonfc(self, batch_graph, step_num):
         if self.update_edges_at_end_only is False or step_num == self.mpnn_steps - 1:
-            # calculate new edge representations
-            edge_mpnn_result = self.update_edges(graphs)
-            new_edges[edge_locations] = edge_mpnn_result
-            new_edges = new_edges * edge_mask.unsqueeze(-1).unsqueeze(-1)
-            if self.use_newest_edges: graphs.edata['edge_spans'] = edge_mpnn_result
+            updated_edges = self.update_edges(batch_graph)
+        else:
+            updated_edges = batch_graph.edata['edge_spans']
 
-        mpnn_result = self.node_mpnn(graphs, node_mask)
+        updated_nodes = self.node_mpnn(batch_graph)
 
-        new_nodes = nodes
-        new_nodes[node_mask.bool()] = mpnn_result
-        new_nodes = new_nodes * node_mask.unsqueeze(-1)
-
-        return new_nodes, new_edges
+        return updated_nodes, updated_edges
 
     def mpnn_step_forward_fc(self, graphs, nodes, edges, node_mask, edge_mask, adj_mat_inds, step_num):
         # calculate new node representations

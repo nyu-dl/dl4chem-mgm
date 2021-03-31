@@ -4,7 +4,13 @@ This repository and its references contain the models, data and scripts used to 
 [Masked Graph Modeling for Molecule Generation](https://chemrxiv.org/articles/preprint/Masked_Graph_Modeling_for_Molecule_Generation/13143167)
 paper.
 
-## Dependencies
+## Installation Guide
+
+We used a Linux OS with an Nvidia Tesla P100-SXM2 GPU with 16 GB of memory.
+
+A conda environment file (environment.yml) is provided as part of this repository. It may contain packages beyond those
+needed to run the scripts here. If not using this file, please install the following dependencies.
+
 ### Python
 
 python 3.7 \
@@ -18,7 +24,7 @@ scipy 1.4.1
 
 ### GPU
 CUDA (We used version 10.0) \
-Pytorch, Tensorflow and dgl installations should correspond to the CUDA version used
+Pytorch, Tensorflow and dgl installations should correspond to the CUDA version used.
 
 ## Datasets
 ### QM9
@@ -56,7 +62,7 @@ As an alternative to using pretrained models, the following are scripts for trai
 `python train.py --data_path data/ChEMBL/ChEMBL_train_processed.p --graph_type ChEMBL --exp_name chembl_experiment
 --val_data_path data/ChEMBL/ChEMBL_val_processed.p --num_node_types 12 --num_edge_types 5 --max_nodes 88
 --min_charge -1 --max_charge 3 --mpnn_steps 6 --layer_norm --spatial_msg_res_conn --batch_size 32 --val_batch_size 64
---grad_accum_iters 16 --val_after 3200 --num_epochs 5 --shuffle --force_mask_predict --mask_independently
+--grad_accum_iters 16 --val_after 3200 --num_epochs 10 --shuffle --force_mask_predict --mask_independently
 --optimizer adam,lr=0.0001 --tensorboard`
 
 ## Training Baseline Transformer Models
@@ -127,12 +133,16 @@ To generate using training initialisation and masking rate 0.01:\
   --dist_file guacamol_v1_all.smiles`
 
 
-## Displaying MGM Generation Results
+## MGM Generation Results
 SMILES strings and distributional results at each recorded generation step can be found in <output_dir> from the
 MGM generation script used above.
 
 To print generation results at each step in a dataframe:
 `python get_best_distributional_results.py <output_dir>`
+
+We also provide a list of SMILES strings of 20,000 generated molecules each for QM9 with a 10% masking rate and ChEMBL 
+with a 1% masking rate [here](https://drive.google.com/drive/folders/1SiOLr3RVr7wcgXUuGoPRn1I-iTwcn2k6?usp=sharing).
+Training initialisation was used in both cases.
 
 ## Citation
 If you've found the resources in this repository useful, please consider citing:

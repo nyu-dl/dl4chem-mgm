@@ -1,5 +1,6 @@
 import os
 import pickle
+import dgl
 from logging import getLogger
 
 import numpy as np
@@ -7,6 +8,7 @@ import scipy.sparse as sparse
 import torch
 from torch.utils.data import DataLoader, Sampler
 from torch.utils.data import Dataset as TorchDataset
+from torch.utils.data._utils.collate import default_collate
 
 from src.utils import set_seed_if
 from .dataset import Dataset
@@ -161,8 +163,8 @@ class QM9DatasetAR(TorchDataset):
     def __len__(self):
         return len(self.mol_nodeinds)
 
-class QM9DatasetGraph(TorchDataset):
-    def __init__(self, graph_infos, params, train=True, graph_properties=None):
+class GraphDataset(TorchDataset):
+    def __init__(self, node_type, edge_type, params, train=True):
         # set parameters
         self.max_nodes = params.max_nodes
         self.num_node_types = params.num_node_types
@@ -191,38 +193,20 @@ class QM9DatasetGraph(TorchDataset):
         self.debug_fixed = params.debug_fixed
         self.equalise = params.equalise
         self.seed = params.seed
-        self.max_hs = params.max_hs
         self.weighted_loss = params.weighted_loss if hasattr(params, 'weighted_loss') else False
 
-        self.node_properties, self.edge_properties, self.graph_properties = {}, {}, {}
-
-        self.min_charge = params.min_charge; self.max_charge = params.max_charge
-        self.mask_all_ring_properties = params.mask_all_ring_properties
-
-        self.node_property_names = ['node_type', 'hydrogens', 'charge', 'is_in_ring', 'is_aromatic', 'chirality']
+        self.node_property_names = ['node_type']
         self.edge_property_names = ['edge_type']
-        self.graph_property_names = ['molwt', 'logp']
-        self.normalise_graph_properties = params.normalise_graph_properties
-        node_type, edge_type, num_hs, charge, is_in_ring, is_aromatic, chirality = zip(*graph_infos)
-        if graph_properties != None:
-            self.graph_properties['molwt'], self.graph_properties['logp'] = zip(*graph_properties)
-            self.graph_property_stats = {name: {'mean': np.mean(data), 'std': np.std(data)} \
-                                         for name, data in self.graph_properties.items()}
+        self.node_properties, self.edge_properties = {}, {}
 
-        num_h_categories = self.max_hs + 1
-        num_charge_categories = abs(self.min_charge) + self.max_charge + 1
-        num_is_in_ring_categories = 2
-        num_is_aromatic_categories = 2
-        num_chirality_categories = 4
+        self.graph_properties = {} # placeholder, assigned in child class
+        self.num_binary_graph_properties = params.num_binary_graph_properties
+        # stored as list of lists, where index of each inner list represents a graph and contents of inner list
+        # are categories (represented as indices) for which that graph has a positive label. Done this way to avoid
+        # memory cost of storing num_binary_graph_properties dicts of size len(dataset)
+        self.graph2binary_properties = [] # placeholder, assigned in child class
 
         if sparse.issparse(edge_type[0]): edge_type = [et.todense() for et in edge_type]
-        # indices -> 0: no hydrogens, max_hs: max_hydrogens, max_hs+1: mask
-        h_mask_index = self.max_hs + 1
-        h_empty_index = 0
-        charge_mask_index = num_charge_categories
-        is_in_ring_mask_index = num_is_in_ring_categories
-        is_aromatic_mask_index = num_is_aromatic_categories
-        chirality_mask_index = num_chirality_categories
         # node arrays are of format [nodes ... , mask]
         # edge arrays are of format [no edge, edge types ... , mask]
         node_mask_index = self.num_node_types
@@ -233,19 +217,11 @@ class QM9DatasetGraph(TorchDataset):
         elif self.no_edge_present_type == 'zeros':
             edge_empty_index = 0
 
-        def add_to_dict(dct, property_name, data, num_categories, mask_index, empty_index):
-            dct[property_name] = {'data': data, 'num_categories': num_categories, 'mask_index': mask_index,
-                                  'empty_index': empty_index}
-        add_to_dict(self.node_properties, 'node_type', node_type, self.num_node_types, node_mask_index, node_empty_index)
-        add_to_dict(self.node_properties, 'hydrogens', num_hs, num_h_categories, h_mask_index, h_empty_index)
-        add_to_dict(self.node_properties, 'charge', charge, num_charge_categories, charge_mask_index, abs(self.min_charge))
-        add_to_dict(self.node_properties, 'is_in_ring', is_in_ring, num_is_in_ring_categories, is_in_ring_mask_index, 0)
-        add_to_dict(self.node_properties, 'is_aromatic', is_aromatic, num_is_aromatic_categories, is_aromatic_mask_index, 0)
-        add_to_dict(self.node_properties, 'chirality', chirality, num_chirality_categories, chirality_mask_index, 0)
 
-        add_to_dict(self.edge_properties, 'edge_type', edge_type, self.num_edge_types, edge_mask_index, edge_empty_index)
-
-        self.node_property_weights, self.edge_property_weights = self.get_loss_weights()
+        self.add_to_property_dict(self.node_properties, 'node_type', node_type, self.num_node_types, node_mask_index,
+                                  node_empty_index)
+        self.add_to_property_dict(self.edge_properties, 'edge_type', edge_type, self.num_edge_types, edge_mask_index,
+                                  edge_empty_index)
 
         self.mask_independently = params.mask_independently
         self.target_data_structs = params.target_data_structs
@@ -257,9 +233,19 @@ class QM9DatasetGraph(TorchDataset):
             self.nodes_only, self.edges_only = False, False
         self.prediction_data_structs = params.prediction_data_structs
 
-        self.pad = True if params.edges_per_batch <= 0 else False
-
+        self.pad = False # padding is counterproductive if using dgl batched graph to represent batch
         self.train = train
+
+    def child_class_end_init(self):
+        """Method to call at end of child class constructor"""
+        for property_name, property_info in self.edge_properties.items():
+            for single_dp_info in property_info['data']:
+                np.fill_diagonal(single_dp_info, 0)
+        self.node_property_weights, self.edge_property_weights = self.get_loss_weights()
+
+    def add_to_property_dict(self, dct, property_name, data, num_categories, mask_index, empty_index):
+        dct[property_name] = {'data': data, 'num_categories': num_categories, 'mask_index': mask_index,
+                              'empty_index': empty_index}
 
     def get_loss_weights(self):
         # ones instead of zeros to avoid possible divide by zero later on
@@ -529,32 +515,16 @@ class QM9DatasetGraph(TorchDataset):
             edge_mask[np.where(init_edge_properties['edge_type'] == 0)] = 0
 
         # Cast to suitable type
-        """
-        init_node_properties = torch.LongTensor(np.stack([init_node_properties[property_name] \
-                                                          for property_name in self.node_property_names]))
-        orig_node_properties = torch.LongTensor(np.stack([orig_node_properties[property_name] \
-                                                          for property_name in self.node_property_names]))
-        node_property_target_types = np.stack([node_property_target_types[property_name] \
-                                              for property_name in self.node_property_names]).astype(np.int8)
-
-        init_edge_properties = torch.LongTensor(np.stack([init_edge_properties[property_name] \
-                                                          for property_name in self.edge_property_names]))
-        orig_edge_properties = torch.LongTensor(np.stack([orig_edge_properties[property_name] \
-                                                          for property_name in self.edge_property_names]))
-        edge_property_target_types = np.stack([edge_property_target_types[property_name] \
-                                               for property_name in self.edge_property_names]).astype(np.int8)
-        """
-
 
         for property_name in init_node_properties.keys():
             init_node_properties[property_name] = torch.LongTensor(init_node_properties[property_name])
             orig_node_properties[property_name] = torch.LongTensor(orig_node_properties[property_name])
-            node_property_target_types[property_name] = node_property_target_types[property_name].astype(np.int8)
+            node_property_target_types[property_name] = torch.IntTensor(node_property_target_types[property_name])
 
         for property_name in init_edge_properties.keys():
             init_edge_properties[property_name] = torch.LongTensor(init_edge_properties[property_name])
             orig_edge_properties[property_name] = torch.LongTensor(orig_edge_properties[property_name])
-            edge_property_target_types[property_name] = edge_property_target_types[property_name].astype(np.int8)
+            edge_property_target_types[property_name] = torch.IntTensor(edge_property_target_types[property_name])
 
         graph_properties = {}
         for k, v in self.graph_properties.items():
@@ -564,14 +534,72 @@ class QM9DatasetGraph(TorchDataset):
             else:
                 graph_properties[k] = torch.Tensor([ v[index] ])
 
+        if self.num_binary_graph_properties > 0:
+            positive_binary_properties = self.graph2binary_properties[index]
+            binary_graph_properties = torch.zeros(self.num_binary_graph_properties)
+            binary_graph_properties[np.array(positive_binary_properties)] = 1
+        else:
+            binary_graph_properties = []
+
+
         ret_list = [init_node_properties, orig_node_properties, node_property_target_types, node_mask,
                     init_edge_properties, orig_edge_properties, edge_property_target_types, edge_mask,
-                    graph_properties]
+                    graph_properties, binary_graph_properties]
 
         return ret_list
 
     def __len__(self):
         return len(self.node_properties['node_type']['data'])
+
+class QM9DatasetGraph(GraphDataset):
+    def __init__(self, graph_infos, params, train=True, graph_properties=None, graph2binary_properties=None):
+        node_type, edge_type, num_hs, charge, is_in_ring, is_aromatic, chirality = zip(*graph_infos)
+        super().__init__(node_type, edge_type, params, train)
+        self.max_hs = params.max_hs
+        self.min_charge = params.min_charge; self.max_charge = params.max_charge
+        self.mask_all_ring_properties = params.mask_all_ring_properties
+
+        self.node_property_names.extend(['hydrogens', 'charge', 'is_in_ring', 'is_aromatic', 'chirality'])
+        self.graph_property_names = ['molwt', 'logp']
+        self.normalise_graph_properties = params.normalise_graph_properties
+        if graph_properties != None:
+            self.graph_properties['molwt'], self.graph_properties['logp'] = zip(*graph_properties)
+            self.graph_property_stats = {name: {'mean': np.mean(data), 'std': np.std(data)} \
+                                         for name, data in self.graph_properties.items()}
+
+        num_h_categories = self.max_hs + 1
+        num_charge_categories = abs(self.min_charge) + self.max_charge + 1
+        num_is_in_ring_categories = 2
+        num_is_aromatic_categories = 2
+        num_chirality_categories = 4
+
+        # indices -> 0: no hydrogens, max_hs: max_hydrogens, max_hs+1: mask
+        h_mask_index = self.max_hs + 1
+        h_empty_index = 0
+        charge_mask_index = num_charge_categories
+        is_in_ring_mask_index = num_is_in_ring_categories
+        is_aromatic_mask_index = num_is_aromatic_categories
+        chirality_mask_index = num_chirality_categories
+
+        self.add_to_property_dict(self.node_properties, 'hydrogens', num_hs, num_h_categories, h_mask_index,
+                                  h_empty_index)
+        self.add_to_property_dict(self.node_properties, 'charge', charge, num_charge_categories, charge_mask_index,
+                                  abs(self.min_charge))
+        self.add_to_property_dict(self.node_properties, 'is_in_ring', is_in_ring, num_is_in_ring_categories,
+                                  is_in_ring_mask_index, 0)
+        self.add_to_property_dict(self.node_properties, 'is_aromatic', is_aromatic, num_is_aromatic_categories,
+                                  is_aromatic_mask_index, 0)
+        self.add_to_property_dict(self.node_properties, 'chirality', chirality, num_chirality_categories,
+                                  chirality_mask_index, 0)
+        self.child_class_end_init()
+
+
+class ProteinGraphDataset(GraphDataset):
+    def __init__(self, graph_infos, params, train=True, graph_properties=None, graph2binary_properties=None):
+        seqs, cmaps = zip(*graph_infos) # node_type, edge_type
+        super().__init__(seqs, cmaps, params, train)
+        self.graph2binary_properties = graph2binary_properties # go labels
+        self.child_class_end_init()
 
 class SizeSampler(Sampler):
     r"""Samples elements sequentially in order of size.
@@ -630,7 +658,7 @@ def load_graph_data(params, train_split=0.8):
                 val_graph_infos = pickle.load(f)
         return train_graph_infos, val_graph_infos
 
-    if params.graph_type == 'QM9':
+    if params.graph_type == 'QM9' or params.graph_type == 'protein':
         val_data_path, val_graph_properties_path = None, None
     elif params.graph_type == 'ChEMBL':
         val_data_path, val_graph_properties_path = params.val_data_path, params.val_graph_properties_path
@@ -638,31 +666,91 @@ def load_graph_data(params, train_split=0.8):
     train_graph_infos, val_graph_infos = load_train_val_data(params.data_path, val_data_path)
     train_graph_infos, filtered_train_indices = limited_node_graph_infos(train_graph_infos, params.max_nodes)
     val_graph_infos, filtered_val_indices = limited_node_graph_infos(val_graph_infos, params.max_nodes)
-    if len(params.graph_property_names) > 0:
-        train_graph_property_infos, val_graph_property_infos = load_train_val_data(
-            params.graph_properties_path, val_graph_properties_path)
-        train_graph_property_infos = [train_graph_property_infos[idx] for idx in filtered_train_indices]
-        val_graph_property_infos = [val_graph_property_infos[idx] for idx in filtered_val_indices]
-    else:
-        train_graph_property_infos = val_graph_property_infos = None
+
+    def load_and_split_from_indices(train_properties_path, val_properties_path, condition):
+        """
+        Return train and val data, split using previously calculated indices if condition is met.
+        If condition is not met, return None for train and None for val.
+        """
+        if condition:
+            train_infos, val_infos = load_train_val_data(train_properties_path, val_properties_path)
+            train_infos = [train_infos[idx] for idx in filtered_train_indices]
+            val_infos = [val_infos[idx] for idx in filtered_val_indices]
+        else:
+            train_infos = val_infos = None
+        return train_infos, val_infos
+
+    train_graph_property_infos, val_graph_property_infos = load_and_split_from_indices(
+        params.graph_properties_path, val_graph_properties_path, len(params.graph_property_names) > 0)
+
+    train_graph2binary_properties, val_graph2binary_properties = load_and_split_from_indices(
+        params.graph2binary_properties_path, params.val_graph2binary_properties_path,
+        params.num_binary_graph_properties > 0)
 
     if params.val_dataset_size > 0:
         val_graph_infos = val_graph_infos[:params.val_dataset_size]
 
-    train_dataset = QM9DatasetGraph(train_graph_infos, params, train=True, graph_properties=train_graph_property_infos)
-    val_dataset = QM9DatasetGraph(val_graph_infos, params, train=False, graph_properties=val_graph_property_infos)
+    dataset_cls = ProteinGraphDataset if params.graph_type == 'protein' else QM9DatasetGraph
+
+    train_dataset = dataset_cls(train_graph_infos, params, train=True, graph_properties=train_graph_property_infos,
+                                    graph2binary_properties=train_graph2binary_properties)
+    val_dataset = dataset_cls(val_graph_infos, params, train=False, graph_properties=val_graph_property_infos,
+                                  graph2binary_properties=val_graph2binary_properties)
     if hasattr(params, 'val_seed'): val_dataset.seed = params.val_seed
     if params.edges_per_batch > 0:
         train_batch_sampler = SizeSampler(train_dataset, params.edges_per_batch, params.shuffle)
         train_batch_sampler.batches.reverse()
-        train_data_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler)
+        train_data_loader = DataLoader(train_dataset, batch_sampler=train_batch_sampler, collate_fn=graph_collate_fn)
         val_batch_sampler = SizeSampler(val_dataset, val_edges_per_batch)
-        val_data_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler)
+        val_data_loader = DataLoader(val_dataset, batch_sampler=val_batch_sampler, collate_fn=graph_collate_fn)
     else:
-        train_data_loader = DataLoader(train_dataset, params.batch_size, shuffle=params.shuffle)
-        val_data_loader = DataLoader(val_dataset, val_batch_size)
+        train_data_loader = DataLoader(train_dataset, params.batch_size, shuffle=params.shuffle,
+                                       collate_fn=graph_collate_fn)
+        val_data_loader = DataLoader(val_dataset, val_batch_size, collate_fn=graph_collate_fn)
 
     return train_dataset, val_dataset, train_data_loader, val_data_loader
+
+def graph_collate_fn(batch):
+    init_graphs, orig_graphs, target_type_graphs, target_type_transpose_graphs = [], [], [], []
+    batch_graph_properties, batch_binary_graph_properties = [], []
+    for element in batch:
+        init_graph, orig_graph, target_type_graph, target_type_transpose_graph = \
+            dgl.DGLGraph(), dgl.DGLGraph(), dgl.DGLGraph(), dgl.DGLGraph()
+
+        init_node_properties, orig_node_properties, node_property_target_types, node_mask, \
+            init_edge_properties, orig_edge_properties, edge_property_target_types, edge_mask, \
+            graph_properties, binary_graph_properties = element
+        edge_property_target_types_transpose = {k: v.t() for k, v in edge_property_target_types.items()}
+
+        batch_graph_properties.append(graph_properties)
+        batch_binary_graph_properties.append(binary_graph_properties)
+
+        num_nodes = node_mask.sum()
+        init_graph.add_nodes(num_nodes, init_node_properties)
+        orig_graph.add_nodes(num_nodes, orig_node_properties)
+        target_type_graph.add_nodes(num_nodes, node_property_target_types)
+        target_type_transpose_graph.add_nodes(num_nodes)
+
+        init_graph.add_edges(*np.where(edge_mask), {k: v[np.where(edge_mask)] for k, v in init_edge_properties.items()})
+        orig_graph.add_edges(*np.where(edge_mask), {k: v[np.where(edge_mask)] for k, v in orig_edge_properties.items()})
+        target_type_graph.add_edges(*np.where(edge_mask), {k: v[np.where(edge_mask)] \
+                                                           for k, v in edge_property_target_types.items()})
+        target_type_transpose_graph.add_edges(*np.where(edge_mask), {k: v[np.where(edge_mask)] \
+                                                           for k, v in edge_property_target_types_transpose.items()})
+
+        init_graphs.append(init_graph)
+        orig_graphs.append(orig_graph)
+        target_type_graphs.append(target_type_graph)
+        target_type_transpose_graphs.append(target_type_transpose_graph)
+
+    batch_init_graph = dgl.batch(init_graphs)
+    batch_orig_graph = dgl.batch(orig_graphs)
+    batch_target_type_graph = dgl.batch(target_type_graphs)
+    batch_target_type_transpose_graph = dgl.batch(target_type_transpose_graphs)
+    batch_graph_properties, batch_binary_graph_properties = default_collate(
+        list(zip(batch_graph_properties, batch_binary_graph_properties)))
+    return batch_init_graph, batch_orig_graph, batch_target_type_graph, batch_target_type_transpose_graph, \
+           batch_graph_properties, batch_binary_graph_properties
 
 def limited_node_graph_infos(graph_infos, max_nodes):
     restricted_graph_infos, indices = [], []

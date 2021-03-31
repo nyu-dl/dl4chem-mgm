@@ -27,9 +27,8 @@ class NodeMPNN(nn.Module):
             node_next = self.layer_norm(node_next)
         return node_next
 
-    def forward(self, g, node_mask):
-        g.send(g.edges(), self.compute_partial_messages)
-        g.recv(g.nodes(), self.reduce_messages)
+    def forward(self, g, node_mask=None):
+        g.send_and_recv(g.edges(), self.compute_partial_messages, self.reduce_messages)
         msg = g.ndata['messages']
         if self.global_connection is True:
             global_connection = g.ndata['nodes'].mean(dim=0)
@@ -37,6 +36,7 @@ class NodeMPNN(nn.Module):
         nodes = self.update_GRU(msg, g.ndata['nodes'])
         if self.spatial_postgru_res_conn is True:
             nodes = nodes + g.ndata['messages']
+        del g.ndata['messages']
         return nodes
 
 class MultiplicationMPNN(NodeMPNN):

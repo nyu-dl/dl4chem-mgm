@@ -36,6 +36,10 @@ def get_parser():
     parser.add_argument("--max_len", type=int, default=300,
                         help="Maximum length of sentences (after splitting into chars)")
     parser.add_argument('--local_cpu', action='store_true')
+    parser.add_argument('--num_samples', type=int, default=10000)
+    parser.add_argument('--evaluate', action='store_true')
+    parser.add_argument('--sample_temperature', type=float, default=1.0)
+    parser.add_argument('--output_dir', default='')
     return parser
 
 def reload_ar_checkpoint(path):
@@ -64,13 +68,14 @@ class SmilesTransformerGenerator(DistributionMatchingGenerator):
     Wraps SmilesTransformer in a class satisfying the DistributionMatchingGenerator interface.
     """
 
-    def __init__(self, params, dico, model):
+    def __init__(self, params, dico, model, sample_temperature):
         self.params = params
         self.model = model
         self.dico = dico
+        self.sample_temperature = sample_temperature
 
     def generate(self, number_samples):
-        return generate_smiles(self.params, self.model, self.dico, number_samples)
+        return generate_smiles(self.params, self.model, self.dico, number_samples, self.sample_temperature)
 
 
 def main(params):
@@ -78,20 +83,28 @@ def main(params):
     set_seed(params.seed)
     params.ar = True
 
+    if not os.path.isdir(params.output_dir): os.makedirs(params.output_dir)
     print("Loading the model from {0}".format(params.model_path))
     # load everything from checkpoint
     model_params, dico, model = reload_ar_checkpoint(params.model_path)
     if params.local_cpu is False:
         model = model.cuda()
     # evaluate distributional results
-    generator = SmilesTransformerGenerator(params, dico, model)
-    json_file_path = os.path.join('/'.join(params.model_path.split('/')[:-1]), 'distribution_learning_results.json')
+    generator = SmilesTransformerGenerator(params, dico, model, params.sample_temperature)
+    json_file_path = os.path.join(params.output_dir, 'distribution_learning_results.json')
+    smiles_output_path = os.path.join(params.output_dir, 'generated_smiles.txt')
     print("Starting distributional evaluation")
     t1 = time.time()
-    assess_distribution_learning(generator,
+    if params.evaluate is True:
+        assess_distribution_learning(generator,
                                  chembl_training_file=params.dist_file,
                                  json_output_file=json_file_path,
                                  benchmark_version=params.suite)
+    else:
+        smiles_list = generator.generate(params.num_samples)
+        with open(smiles_output_path, 'w') as f:
+            for smiles in smiles_list:
+                f.write(smiles + '\n')
     t2 = time.time()
     print ("Total time taken {}".format(t2-t1))
 

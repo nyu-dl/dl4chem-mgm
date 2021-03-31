@@ -8,15 +8,11 @@ import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 
 from src.data.loader import load_graph_data
-from src.evaluation.nbrhood_stats_aggregator import aggregate_stats
-from src.evaluation.perturbation_evaluator import run_perturbations
 from src.logger import create_logger
 from src.model.gnn import MODELS_DICT
 from src.model.graph_generator import GraphGenerator
-from src.utils import set_seed_if, get_optimizer, get_index_method, get_only_target_info, \
-    get_ds_stats, check_validity, write_tensorboard, get_all_result_distributions, update_ds_stats, \
-    accuracies_from_totals, lr_decay_multiplier, save_checkpoints, calculate_gen_benchmarks, get_loss_weights, get_loss, \
-    get_majority_and_minority_stats, dct_to_cuda, normalise_loss
+from src.utils import set_seed_if, get_optimizer, get_index_method, write_tensorboard, lr_decay_multiplier, \
+    save_checkpoints, calculate_gen_benchmarks, get_loss, dct_to_cuda_inplace, normalise_loss
 from train_script_parser import get_parser
 
 
@@ -45,16 +41,13 @@ def setup_data_and_model(params, model):
     logger.info("")
     # load data
     train_data, val_dataset, train_loader, val_loader = load_graph_data(params)
-    if params.run_perturbation_analysis is True:
-        params.do_not_corrupt = True
-        params.batch_size = params.perturbation_batch_size
-        params.edges_per_batch = params.perturbation_edges_per_batch
-        _, _, _, perturbation_loader = load_graph_data(params)
-        del _
 
     logger.info ('train_loader len is {}'.format(len(train_loader)))
     logger.info ('val_loader len is {}'.format(len(val_loader)))
 
+    if params.num_binary_graph_properties > 0 and params.pretrained_property_embeddings_path:
+        model.binary_graph_property_embedding_layer.weight.data = \
+            torch.Tensor(np.load(params.pretrained_property_embeddings_path).T)
     if params.load_latest is True:
         load_prefix = 'latest'
     elif params.load_best is True:
@@ -113,11 +106,11 @@ def main(params):
                 logger.info('Done training')
                 break
             model.train()
+            if hasattr(model, 'seq_model'): model.seq_model.eval()
 
             # Training step
-            init_node_properties, orig_node_properties, node_property_target_types, node_mask, \
-            init_edge_properties, orig_edge_properties, edge_property_target_types, edge_mask,\
-            graph_properties = train_batch
+            batch_init_graph, batch_orig_graph, batch_target_type_graph, _, \
+            graph_properties, binary_graph_properties = train_batch
             # init is what goes into model
             # target_inds and target_coords are 1 at locations to be predicted, 0 elsewhere
             # target_inds and target_coords are now calculated here rather than in dataloader
@@ -125,74 +118,45 @@ def main(params):
             # masks are 1 in places corresponding to nodes that exist, 0 in other places (which are empty/padded)
             # target_types are 1 in places to mask, 2 in places to replace, 3 in places to reconstruct, 0 in places not to predict
 
-            node_property_target_types_bool = {name: getattr(tt != 0, index_method)() \
-                                               for name, tt in node_property_target_types.items()}
-            edge_property_target_types_bool = {name: getattr(tt != 0, index_method)() \
-                                               for name, tt in edge_property_target_types.items()}
-
             if params.local_cpu is False:
-                init_node_properties = dct_to_cuda(init_node_properties)
-                orig_node_properties = dct_to_cuda(orig_node_properties)
-                node_property_target_types = dct_to_cuda(node_property_target_types)
-                node_mask = node_mask.cuda()
-                init_edge_properties = dct_to_cuda(init_edge_properties)
-                orig_edge_properties = dct_to_cuda(orig_edge_properties)
-                edge_property_target_types = dct_to_cuda(edge_property_target_types)
-                edge_mask = edge_mask.cuda()
-                graph_properties = dct_to_cuda(graph_properties)
+                batch_init_graph = batch_init_graph.to(torch.device('cuda:0'))
+                batch_orig_graph = batch_orig_graph.to(torch.device('cuda:0'))
+                dct_to_cuda_inplace(graph_properties)
+                if binary_graph_properties: binary_graph_properties = binary_graph_properties.cuda()
 
             if grad_accum_iters % params.grad_accum_iters == 0:
                 opt.zero_grad()
 
-            node_property_scores, edge_property_scores, graph_property_scores = model(
-                init_node_properties, node_mask, init_edge_properties, edge_mask, graph_properties)
+            _, batch_scores_graph, graph_property_scores = model(batch_init_graph, graph_properties,
+                binary_graph_properties)
 
-            num_classes = {property_name: scores.shape[-1] for property_name, scores in node_property_scores.items()}
-            num_classes.update({property_name: scores.shape[-1] for \
-                                property_name, scores in edge_property_scores.items()})
-
-            # slice out target data structures
-            target_node_properties = {}
-            for property_name, scores in node_property_scores.items():
-                node_property_scores[property_name], target_node_properties[property_name], \
-                    node_property_target_types[property_name] = get_only_target_info(scores,
-                                                                orig_node_properties[property_name],
-                                                                node_property_target_types_bool[property_name],
-                                                                num_classes[property_name],
-                                                                node_property_target_types[property_name])
-            target_edge_properties = {}
-            for property_name, scores in edge_property_scores.items():
-                edge_property_scores[property_name], target_edge_properties[property_name], \
-                    edge_property_target_types[property_name] = get_only_target_info(scores,
-                                                                orig_edge_properties[property_name],
-                                                                edge_property_target_types_bool[property_name],
-                                                                num_classes[property_name],
-                                                                edge_property_target_types[property_name])
-
-
-            num_components = sum([len(p) for p in target_node_properties.values()]) + \
-                             sum([len(p) for p in target_edge_properties.values()])
+            num_components = sum([(v != 0).sum().numpy() for _, v in batch_target_type_graph.ndata.items()]) + \
+                             sum([(v != 0).sum().numpy() for _, v in batch_target_type_graph.edata.items()])
 
             # calculate score
             losses = []
             results_dict = {}
             metrics_to_print = []
             if params.target_data_structs in ['nodes', 'both', 'random'] and \
-                    len(target_node_properties['node_type']) > 0:
+                    batch_target_type_graph.ndata['node_type'].sum() > 0:
                 node_losses = {}
-                for name, target_property in target_node_properties.items():
-                    node_losses[name] = get_loss(target_property, node_property_scores[name], params.equalise,
-                                         params.loss_normalisation_type, num_components, params.local_cpu)
+                for name, target_type in batch_target_type_graph.ndata.items():
+                    node_losses[name] = get_loss(
+                        batch_orig_graph.ndata[name][target_type.numpy() != 0],
+                        batch_scores_graph.ndata[name][target_type.numpy() != 0],
+                        params.equalise, params.loss_normalisation_type, num_components, params.local_cpu)
                 losses.extend(node_losses.values())
                 results_dict.update(node_losses)
                 metrics_to_print.extend(node_losses.keys())
 
             if params.target_data_structs in ['edges', 'both', 'random'] and \
-                    len(target_edge_properties['edge_type']) > 0:
+                    batch_target_type_graph.edata['edge_type'].sum() > 0:
                 edge_losses = {}
-                for name, target_property in target_edge_properties.items():
-                    edge_losses[name] = get_loss(target_property, edge_property_scores[name], params.equalise,
-                                         params.loss_normalisation_type, num_components, params.local_cpu)
+                for name, target_type in batch_target_type_graph.edata.items():
+                    edge_losses[name] = get_loss(
+                        batch_orig_graph.edata[name][target_type.numpy() != 0],
+                        batch_scores_graph.edata[name][target_type.numpy() != 0],
+                        params.equalise, params.loss_normalisation_type, num_components, params.local_cpu)
                 losses.extend(edge_losses.values())
                 results_dict.update(edge_losses)
                 metrics_to_print.extend(edge_losses.keys())
@@ -251,76 +215,40 @@ def main(params):
                 graph_property_losses = {name: 0 for name in params.graph_property_names}
                 model.eval()
                 set_seed_if(params.seed)
-                is_valid_list, is_connected_list = [], []
-                for init_node_properties, orig_node_properties, node_property_target_types, node_mask, \
-                    init_edge_properties, orig_edge_properties, edge_property_target_types, edge_mask, \
-                    graph_properties in val_loader:
-
-                    node_property_target_types_bool = {name: getattr(tt != 0, index_method)() \
-                                                       for name, tt in node_property_target_types.items()}
-                    edge_property_target_types_bool = {name: getattr(tt != 0, index_method)() \
-                                                       for name, tt in edge_property_target_types.items()}
+                for batch_init_graph, batch_orig_graph, batch_target_type_graph, _, \
+                    graph_properties, binary_graph_properties in val_loader:
 
                     if params.local_cpu is False:
-                        init_node_properties = dct_to_cuda(init_node_properties)
-                        orig_node_properties = dct_to_cuda(orig_node_properties)
-                        node_property_target_types = dct_to_cuda(node_property_target_types)
-                        node_mask = node_mask.cuda()
-                        init_edge_properties = dct_to_cuda(init_edge_properties)
-                        orig_edge_properties = dct_to_cuda(orig_edge_properties)
-                        edge_property_target_types = dct_to_cuda(edge_property_target_types)
-                        edge_mask = edge_mask.cuda()
-                        graph_properties = dct_to_cuda(graph_properties)
+                        batch_init_graph = batch_init_graph.to(torch.device('cuda:0'))
+                        batch_orig_graph = batch_orig_graph.to(torch.device('cuda:0'))
+                        dct_to_cuda_inplace(graph_properties)
+                        if binary_graph_properties: binary_graph_properties = binary_graph_properties.cuda()
 
                     with torch.no_grad():
-                        node_property_scores, edge_property_scores, graph_property_scores = model(
-                            init_node_properties, node_mask, init_edge_properties, edge_mask, graph_properties)
+                        _, batch_scores_graph, graph_property_scores = model(batch_init_graph, graph_properties,
+                                                                             binary_graph_properties)
 
-                    num_classes = {property_name: scores.shape[-1] for property_name, scores in
-                                   node_property_scores.items()}
-                    num_classes.update({property_name: scores.shape[-1] for \
-                                        property_name, scores in edge_property_scores.items()})
-
-                    # slice out target data structures
-                    target_node_properties = {}
-                    for property_name, scores in node_property_scores.items():
-                        node_property_scores[property_name], target_node_properties[property_name], \
-                            node_property_target_types[property_name] = get_only_target_info(scores,
-                                                                        orig_node_properties[property_name],
-                                                                        node_property_target_types_bool[property_name],
-                                                                        num_classes[property_name],
-                                                                        node_property_target_types[property_name])
-                    target_edge_properties = {}
-                    for property_name, scores in edge_property_scores.items():
-                        edge_property_scores[property_name], target_edge_properties[property_name], \
-                            edge_property_target_types[property_name] = get_only_target_info(scores,
-                                                                        orig_edge_properties[property_name],
-                                                                        edge_property_target_types_bool[property_name],
-                                                                        num_classes[property_name],
-                                                                        edge_property_target_types[property_name])
-
-                    batch_size = init_node_properties['node_type'].shape[0]
-                    num_data_points += batch_size
-
+                    num_data_points += float(batch_orig_graph.batch_size)
                     losses = []
                     if params.target_data_structs in ['nodes', 'both', 'random'] and \
-                            len(target_node_properties['node_type']) > 0:
-                        for name, target_property in target_node_properties.items():
-
-                            iter_node_property_loss = F.cross_entropy(node_property_scores[name],
-                                                    target_node_properties[name], reduction='sum').cpu().item()
+                            batch_target_type_graph.ndata['node_type'].sum() > 0:
+                        for name, target_type in batch_target_type_graph.ndata.items():
+                            iter_node_property_loss = F.cross_entropy(
+                                batch_scores_graph.ndata[name][target_type.numpy() != 0],
+                                batch_orig_graph.ndata[name][target_type.numpy() != 0], reduction='sum').cpu().item()
                             node_property_losses[name] += iter_node_property_loss
                             losses.append(iter_node_property_loss)
-                            node_property_num_components[name] += len(target_property)
+                            node_property_num_components[name] += float((target_type != 0).sum())
 
                     if params.target_data_structs in ['edges', 'both', 'random'] and \
-                            len(target_edge_properties['edge_type']) > 0:
-                        for name, target_property in target_edge_properties.items():
-                            iter_edge_property_loss = F.cross_entropy(edge_property_scores[name],
-                                                    target_edge_properties[name], reduction='sum').cpu().item()
+                            batch_target_type_graph.edata['edge_type'].sum() > 0:
+                        for name, target_type in batch_target_type_graph.edata.items():
+                            iter_edge_property_loss = F.cross_entropy(
+                                batch_scores_graph.edata[name][target_type.numpy() != 0],
+                                batch_orig_graph.edata[name][target_type.numpy() != 0], reduction='sum').cpu().item()
                             edge_property_losses[name] += iter_edge_property_loss
                             losses.append(iter_edge_property_loss)
-                            edge_property_num_components[name] += len(target_property)
+                            edge_property_num_components[name] += float((target_type != 0).sum())
 
                     if params.predict_graph_properties is True:
                         for name, scores in graph_property_scores.items():
@@ -372,28 +300,15 @@ def main(params):
                 for name, loss in results_dict.items():
                     logger.info('{}: {:.2f}'.format(name, loss))
 
-                if params.run_perturbation_analysis is True:
-                    preds = run_perturbations(perturbation_loader, model, params.embed_hs,
-                                              params.max_hs, params.perturbation_batch_size, params.local_cpu)
-                    stats, percentages = aggregate_stats(preds)
-                    logger.info('Percentages: {}'.format( pp.pformat(percentages) ))
-
                 if params.tensorboard:
-                    if params.run_perturbation_analysis is True:
-                        writer.add_scalars('dev/perturbation_stability', {str(key): val for key, val in
-                                                                          percentages.items()}, val_iter)
                     write_tensorboard(writer, 'Dev', results_dict, val_iter)
-
                 if params.gen_num_samples > 0:
                     calculate_gen_benchmarks(generator, params.gen_num_samples, training_smiles, logger)
 
                 logger.info("----------------------------------")
-
                 model_state_dict = model.module.state_dict() if torch.cuda.device_count() > 1 else model.state_dict()
-
                 best_loss = save_checkpoints(total_iter, avg_val_loss, best_loss, model_state_dict, opt.state_dict(),
                                              exp_path, logger, params.no_save, params.save_all)
-
                 # Reset random seed
                 set_seed_if(params.seed)
                 logger.info('Validation complete')
