@@ -1,7 +1,7 @@
 # Masked Graph Modeling for Molecule Generation
 
 This repository and its references contain the models, data and scripts used to carry out the experiments in the
-Masked Graph Modeling for Molecule Generation paper.
+[Masked graph modeling for molecule generation](https://www.nature.com/articles/s41467-021-23415-2) paper.
 
 ## Installation Guide
 
@@ -142,3 +142,7 @@ To print generation results at each step in a dataframe:
 We also provide a list of SMILES strings of 20,000 generated molecules each for QM9 with a 10% masking rate and ChEMBL 
 with a 1% masking rate [here](https://drive.google.com/drive/folders/1SiOLr3RVr7wcgXUuGoPRn1I-iTwcn2k6?usp=sharing).
 Training initialisation was used in both cases.
+
+## Citation
+If you have found the materials in this repository useful, please consider citing:
+Mahmood, O., Mansimov, E., Bonneau, R. et al. Masked graph modeling for molecule generation. Nat Commun 12, 3156 (2021). https://doi.org/10.1038/s41467-021-23415-2
