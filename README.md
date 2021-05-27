@@ -1,3 +1,5 @@
+[![DOI](https://zenodo.org/badge/299354589.svg)](https://zenodo.org/badge/latestdoi/299354589)
+
 # Masked Graph Modeling for Molecule Generation
 
 This repository and its references contain the models, data and scripts used to carry out the experiments in the
