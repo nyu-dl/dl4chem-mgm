@@ -112,8 +112,6 @@ def main(params):
             batch_init_graph, batch_orig_graph, batch_target_type_graph, _, \
             graph_properties, binary_graph_properties = train_batch
             # init is what goes into model
-            # target_inds and target_coords are 1 at locations to be predicted, 0 elsewhere
-            # target_inds and target_coords are now calculated here rather than in dataloader
             # original are uncorrupted data (used for comparison with prediction in loss calculation)
             # masks are 1 in places corresponding to nodes that exist, 0 in other places (which are empty/padded)
             # target_types are 1 in places to mask, 2 in places to replace, 3 in places to reconstruct, 0 in places not to predict

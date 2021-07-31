@@ -90,7 +90,7 @@ The `--node_target_frac` and `--edge_target_frac` options set the masking rate f
 
 To generate using training initialisation and masking rate 0.1:\
 `python generate.py --data_path data/QM9/QM9_processed.p --graph_type QM9
---model_path dumped/QM9_experiment/best_model --smiles_dataset_path data/QM9_smiles.txt
+--model_path dumped/QM9_experiment/best_model --smiles_dataset_path data/QM9/QM9_smiles.txt
 --output_dir dumped/QM9_experiment/generation/train_init/mask10/results
 --num_node_types 5 --num_edge_types 5 --max_nodes 9 --layer_norm --embed_hs --spatial_msg_res_conn
 --num_iters 400 --num_sampling_iters 400
@@ -100,7 +100,7 @@ To generate using training initialisation and masking rate 0.1:\
 
 To generate using marginal initialisation and masking rate 0.2:\
 `python generate.py --data_path data/QM9/QM9_processed.p --graph_type QM9
---model_path dumped/QM9_experiment/best_model --smiles_dataset_path data/QM9_smiles.txt
+--model_path dumped/QM9_experiment/best_model --smiles_dataset_path data/QM9/QM9_smiles.txt
 --output_dir dumped/QM9_experiment/generation/marginal_init/mask20/results
 --num_node_types 5 --num_edge_types 5 --max_nodes 9 --layer_norm --embed_hs --spatial_msg_res_conn
 --num_iters 400 --num_sampling_iters 400

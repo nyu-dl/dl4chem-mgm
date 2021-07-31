@@ -136,6 +136,12 @@ def get_parser():
     parser.add_argument("--force_replace_predict", action='store_true', help='predict at least one replaced component '
                                                                              'per graph')
 
+    # MAT parameters
+    parser.add_argument('--mat_N', type=int, default=2, help='number of dense layers in positionwise feedforward')
+    parser.add_argument('--mat_d_model', type=int, default=64, help='model dimensionality')
+    parser.add_argument('--mat_h', type=int, default=8, help='number of attention heads')
+    parser.add_argument('--mat_dropout', type=float, default=0.1, help='dropout probability')
+
     # optimizer parameters
     parser.add_argument("--optimizer", type=str, default="adam,beta1=0.9,beta2=0.98,lr=0.0001",
                         help="Optimizer (SGD / RMSprop / Adam, etc.)")
