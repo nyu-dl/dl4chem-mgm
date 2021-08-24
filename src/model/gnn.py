@@ -135,7 +135,7 @@ class GraphNNParent(nn.Module):
             edge_embeddings.append(self.edge_embedding_layers[name](property))
         edge_embeddings = torch.stack(edge_embeddings).sum(0)
         node_embeddings = self.add_property_embeddings(node_embeddings, graph_properties, binary_graph_properties,
-                                                       batch_graph.batch_num_nodes)
+                                                       batch_graph.batch_num_nodes())
         batch_graph.ndata['nodes'] = node_embeddings
         batch_graph.edata['edge_spans'] = edge_embeddings.reshape(-1, self.dim_h, self.dim_k)
 
@@ -219,13 +219,13 @@ class SeqGraphNN(GraphNN):
         return node_embeddings
 
     def calculate_embeddings(self, batch_graph, graph_properties=None, binary_graph_properties=None):
-        node_embeddings = self.calculate_seq_embeddings(batch_graph.ndata['node_type'], batch_graph.batch_num_nodes)
+        node_embeddings = self.calculate_seq_embeddings(batch_graph.ndata['node_type'], batch_graph.batch_num_nodes())
         edge_embeddings = []
         for name, property in batch_graph.edata.items():
             edge_embeddings.append(self.edge_embedding_layers[name](property))
         edge_embeddings = torch.stack(edge_embeddings).sum(0)
         node_embeddings = self.add_property_embeddings(node_embeddings, graph_properties, binary_graph_properties,
-                                                       batch_graph.batch_num_nodes)
+                                                       batch_graph.batch_num_nodes())
         batch_graph.ndata['nodes'] = node_embeddings
         batch_graph.edata['edge_spans'] = edge_embeddings.reshape(-1, self.dim_h, self.dim_k)
 

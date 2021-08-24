@@ -296,8 +296,8 @@ class GraphGenerator(DistributionMatchingGenerator):
                                     mols, smiles_list):
         all_final_len = len(all_final_node_properties[list(all_final_node_properties.keys())[0]])
         node_start, edge_start = 0, 0
-        for i, num_nodes in enumerate(batch_init_graph.batch_num_nodes):
-            num_edges = batch_init_graph.batch_num_edges[i]
+        for i, num_nodes in enumerate(batch_init_graph.batch_num_nodes()):
+            num_edges = batch_init_graph.batch_num_edges()[i]
             for name, property in batch_init_graph.ndata.items():
                 all_final_node_properties[name].append(property[node_start:node_start+num_nodes].numpy())
             all_final_node_masks.append(np.ones(num_nodes)) # redundant but needs to remain until node masks removed
