@@ -28,7 +28,7 @@ def get_parser():
     parser.add_argument('--pretrained_property_embeddings_path', type=str,
                         default='data/proteins/preprocessed_go_embeddings.npy', help='path to pretrained embeddings '
                                 'for binary graph properties such as GO terms')
-    parser.add_argument("--seed", type=int, default=0,
+    parser.add_argument("--seed", type=int, default=-1,
                         help="random seed")
     parser.add_argument('--val_seed', type=int, default=None)
     parser.add_argument('--save_all', action='store_true', help='save all models, as opposed to only best and latest '
